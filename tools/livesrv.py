@@ -45,7 +45,8 @@ def audio_feed(live):
 
 class Live:
     """ffmpeg -> psvpack -> whole pictures (and MP2 frames), handed to fastsrv as they come.
-    a: fps, rate ("12M"), title, grab ("gdigrab" / "ddagrab"), region ("X,Y,WxH"), audio (bool), audio_rate ("192k")."""
+    a: fps, rate ("12M"), title, grab ("gdigrab" / "ddagrab"), encoder ("mpeg2video" / "mpeg2_qsv"), region
+    ("X,Y,WxH"), audio (bool), audio_rate ("192k")."""
 
     def __init__(self, a):
         self.a, self.audio = a, getattr(a, "audio", False)
@@ -84,13 +85,19 @@ class Live:
         # no B pictures (nothing to reorder), each picture written out as it is coded. A whole picture only every ten
         # seconds: it is ~100 KB, 40 ms and more on the PS2's network, and nothing is lost on the way that it would
         # have to repair (cuts get their own). The rate control's buffer is small: no picture much over its share
+        rate = ["-b:v", a.rate, "-maxrate", a.rate, "-bufsize", str(int(float(a.rate.rstrip("M")) * 1e6 / 4))]
+        if getattr(a, "encoder", "mpeg2video") == "mpeg2_qsv":
+            # Intel's hardware encoder: the CPU is the game's. async_depth 1: it hands a picture back before it takes
+            # the next (4, its default, are 100 ms more)
+            fmt, enc = "nv12", ["-c:v", "mpeg2_qsv", "-async_depth", "1", "-bf", "0", "-g", str(a.fps * 10), *rate]
+        else:
+            fmt = "yuv420p"
+            enc = ["-c:v", "mpeg2video", "-bf", "0", "-g", str(a.fps * 10), "-dc", "10", *rate, "-flags", "+low_delay"]
         self.ffmpeg = subprocess.Popen(
             ["ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", *grab, "-map", "0:v",
-             "-vf", pre + "scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p",
-             "-c:v", "mpeg2video", "-bf", "0", "-g", str(a.fps * 10), "-dc", "10", "-b:v", a.rate, "-maxrate", a.rate,
-             "-bufsize", str(int(float(a.rate.rstrip("M")) * 1e6 / 4)), "-flags", "+low_delay", "-flush_packets", "1",
-             "-f", "mpeg2video", "-", *aout], stdin=subprocess.PIPE if self.audio else None, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, bufsize=0)
+             "-vf", pre + f"scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format={fmt}",
+             *enc, "-flush_packets", "1", "-f", "mpeg2video", "-", *aout],
+            stdin=subprocess.PIPE if self.audio else None, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         # the Windows build if it is there (tools/build_psvpack.bat): through WSL's pipes a picture took ~30 ms more
         exe = Path(__file__).with_name("psvpack.exe")
         pack = [str(exe)] if exe.exists() else ["wsl", "./tools/psvpack"]
@@ -195,6 +202,8 @@ def add_args(ap):
     ap.add_argument("--title", help="one window instead of the desktop")
     ap.add_argument("--region", help="X,Y,WxH of the desktop (physical pixels) instead of all of it")
     ap.add_argument("--grab", default="gdigrab", choices=["gdigrab", "ddagrab"], help="how the screen is captured")
+    ap.add_argument("--encoder", default="mpeg2video", choices=["mpeg2video", "mpeg2_qsv"],
+                    help="mpeg2_qsv: Intel Quick Sync, when a game needs the CPU")
     ap.add_argument("--audio", action="store_true", help="what Windows plays, as MP2 (pip install soundcard numpy)")
     ap.add_argument("--audio-rate", default="192k")
 

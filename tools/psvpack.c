@@ -1,4 +1,4 @@
-// psvpack: an MPEG-2 video elementary stream (I/P frame pictures, progressive, frame_pred_frame_dct, table B-14)
+// psvpack: an MPEG-2 video elementary stream (I/P frame pictures, progressive, frame_pred_frame_dct)
 // repacked for the PS2 as PS2V: per picture, a side stream of macroblock records the EE reads from RAM (type,
 // quantiser, the motion vector already decoded) and an IPU stream with nothing but each coded macroblock's block
 // layer (coded_block_pattern + coefficients), so the IPU decodes macroblock after macroblock (BDEC) and the EE never
@@ -193,6 +193,45 @@ static void coefs(int first) // B-14, only the lengths: to the end of block. fir
 		pos += l;
 	}
 }
+// B-15, the other table for intra blocks (intra_vlc_format 1; hardware encoders use it): {code, bits} before the
+// sign, the standard's values as libavcodec/mpeg12data.c lists them. Then its escape ('000001' + 18 bits) and its
+// end of block ('0110'). Only the lengths are needed: len15[the next 16 bits] = the code's bits, 0x80 | 4 for the
+// end of block, 0 for none
+static const uint16_t b15[][2] = {
+	{0x02, 2}, {0x06, 3}, {0x07, 4}, {0x1c, 5}, {0x1d, 5}, {0x05, 6}, {0x04, 6}, {0x7b, 7},
+	{0x7c, 7}, {0x23, 8}, {0x22, 8}, {0xfa, 8}, {0xfb, 8}, {0xfe, 8}, {0xff, 8}, {0x1f, 14},
+	{0x1e, 14}, {0x1d, 14}, {0x1c, 14}, {0x1b, 14}, {0x1a, 14}, {0x19, 14}, {0x18, 14}, {0x17, 14},
+	{0x16, 14}, {0x15, 14}, {0x14, 14}, {0x13, 14}, {0x12, 14}, {0x11, 14}, {0x10, 14}, {0x18, 15},
+	{0x17, 15}, {0x16, 15}, {0x15, 15}, {0x14, 15}, {0x13, 15}, {0x12, 15}, {0x11, 15}, {0x10, 15},
+	{0x02, 3}, {0x06, 5}, {0x79, 7}, {0x27, 8}, {0x20, 8}, {0x16, 13}, {0x15, 13}, {0x1f, 15},
+	{0x1e, 15}, {0x1d, 15}, {0x1c, 15}, {0x1b, 15}, {0x1a, 15}, {0x19, 15}, {0x13, 16}, {0x12, 16},
+	{0x11, 16}, {0x10, 16}, {0x05, 5}, {0x07, 7}, {0xfc, 8}, {0x0c, 10}, {0x14, 13}, {0x07, 5},
+	{0x26, 8}, {0x1c, 12}, {0x13, 13}, {0x06, 6}, {0xfd, 8}, {0x12, 12}, {0x07, 6}, {0x04, 9},
+	{0x12, 13}, {0x06, 7}, {0x1e, 12}, {0x14, 16}, {0x04, 7}, {0x15, 12}, {0x05, 7}, {0x11, 12},
+	{0x78, 7}, {0x11, 13}, {0x7a, 7}, {0x10, 13}, {0x21, 8}, {0x1a, 16}, {0x25, 8}, {0x19, 16},
+	{0x24, 8}, {0x18, 16}, {0x05, 9}, {0x17, 16}, {0x07, 9}, {0x16, 16}, {0x0d, 10}, {0x15, 16},
+	{0x1f, 12}, {0x1a, 12}, {0x19, 12}, {0x17, 12}, {0x16, 12}, {0x1f, 13}, {0x1e, 13}, {0x1d, 13},
+	{0x1c, 13}, {0x1b, 13}, {0x1f, 16}, {0x1e, 16}, {0x1d, 16}, {0x1c, 16}, {0x1b, 16}, {0x01, 6},
+};
+static uint8_t len15[65536];
+static void b15_init(void)
+{
+	for (unsigned i = 0; i < sizeof b15 / sizeof b15[0] + 2; i++) {
+		unsigned code = i < 111 ? b15[i][0] : i == 111 ? 1 : 6, bits = i < 111 ? b15[i][1] : i == 111 ? 6 : 4;
+		unsigned len = i < 111 ? bits + 1 : i == 111 ? 24 : 0x80 | 4;
+		for (unsigned v = code << (16 - bits); v < (code + 1) << (16 - bits); v++) len15[v] = len;
+	}
+}
+static void coefs15(void)
+{
+	for (;;) {
+		unsigned l = len15[peek(16)];
+		if (!l) { die("DCT coefficient (B-15)"); return; }
+		if (l & 0x80) { pos += 4; return; }
+		pos += l;
+	}
+}
+
 static void dc(int chroma) // B-12, B-13 and the differential
 {
 	unsigned v = peek(10);
@@ -289,7 +328,6 @@ static void unit(int code)
 			get(1);
 			int fpfd = get(1), cmv = get(1), qst = get(1), ivf = get(1), as = get(1);
 			if (ps != 3 || !fpfd || cmv) die("only frame pictures with frame_pred_frame_dct and no concealment vectors");
-			if (ivf) die("intra_vlc_format 1 (table B-15): not handled yet");
 			S.fcode[0] = f0, S.fcode[1] = f1, S.flags = idp | qst << 2 | as << 3 | ivf << 4;
 		}
 	} else if (code == 0x00) { // picture header
@@ -314,7 +352,11 @@ static void unit(int code)
 			uint64_t from = pos;
 			if (t & INTRA) {
 				pmv[0] = pmv[1] = 0;
-				for (int b = 0; b < 6; b++) dc(b >= 4), coefs(0);
+				for (int b = 0; b < 6; b++) {
+					dc(b >= 4);
+					if (S.flags & 16) coefs15();
+					else coefs(0);
+				}
 			} else if (t & PATTERN) {
 				for (int c = cbp(); c; c &= c - 1) coefs(1);
 			}
@@ -387,6 +429,7 @@ int main(int argc, char **argv)
 		fwrite(head, 1, 64, o);
 	}
 	W = malloc(CAP + 64), side = malloc(CAP);
+	b15_init();
 	for (;;) {
 		if (streaming && (pos >> 3) > (4u << 20)) { // what was read, dropped
 			size_t k = pos >> 3;

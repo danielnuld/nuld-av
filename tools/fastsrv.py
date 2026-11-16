@@ -12,6 +12,7 @@ import threading
 import time
 
 PAY = 1408
+OUT = 32  # 45 KB: 4 MB/s still fit between two of the PS2's reports (8 ms)
 
 
 def serve(port, open_stream, name="fast"):
@@ -78,6 +79,7 @@ class _Client:
         self.mark = (0, 0)
         self.back_at, self.back_when, self.last_tx = -1, now, now
         self.said, self.said_at = (0, 0, 0), now  # base, total, again at the last line printed
+        self.same = 0  # feedbacks in a row that want the same datagram while more are out
 
     def go_back(self, now):
         self.next, self.moved, self.again = self.base, now, self.again + 1
@@ -87,9 +89,11 @@ class _Client:
         if expect > self.base:
             for k in range(self.base, expect):
                 self.out.pop(k, None)
-            self.base, self.moved = expect, now
+            self.base, self.moved, self.same = expect, now, 0
             if self.next < expect:
                 self.next = expect
+        elif self.next > self.base:
+            self.same += 1
         self.window = window
         # a gap: again from what it wants, at once (everything sent past the gap is thrown away there: on the console,
         # 2026-11-15, waiting 20 ms here cost ~40 datagrams a gap and a storm of gaps halved the rate). Once per
@@ -97,8 +101,12 @@ class _Client:
         # ...or datagrams are out, it still wants the first of them and nothing was sent after to show it the gap
         # (a live picture's last datagram lost): again without waiting for the 100 ms below
         quiet = self.next > self.base and expect == self.base and now - self.last_tx > 0.015
-        if (flags & 1 or quiet) and self.next > self.base and (self.base != self.back_at or now - self.back_when > 0.03):
-            self.back_at, self.back_when = self.base, now
+        # ...or it says twice running (16 ms) that it still wants the same one while more are out: a gap whose one
+        # "gap" report was lost on the way here. Until the 100 ms below everything sent meanwhile was thrown away
+        # there, up to 180 datagrams a gap: with a game through GeForce NOW on Wi-Fi, 3599 sent for 2265 taken in
+        # 5 s and the pictures piled up 2/3 s behind (console, 2026-11-16)
+        if (flags & 1 or quiet or self.same >= 2) and self.next > self.base and (self.base != self.back_at or now - self.back_when > 0.03):
+            self.back_at, self.back_when, self.same = self.base, now, 0
             self.go_back(now)
 
     def packet(self, seq):
@@ -140,7 +148,11 @@ class _Client:
         self.last, due = now, self.due
         if self.sent < due - 3 * PAY:  # behind: no catching up in a burst (the PS2's receive FIFO is 16 KB)
             self.sent = due - 3 * PAY
-        while self.sent < due and self.next < self.base + self.window:
+        # never more than OUT datagrams unanswered, whatever the PS2 allows: what is out when one is lost is thrown away
+        # there, and when the one sent again is lost too (or the PS2 is not taking: both its stages full) the next
+        # try is 30 ms away. At 2600 KB/s that was ~55 more each time: 58 a gap on the console with a game through
+        # GeForce NOW (2026-11-16), a third of everything sent, and the pictures fell 2/3 s behind
+        while self.sent < due and self.next < self.base + min(self.window, OUT):
             if self.end is not None and self.next > self.end:
                 break
             p = self.packet(self.next)

@@ -137,7 +137,9 @@ static int fast_enq(void *pbuf)
 		return 1;
 	}
 	f_n += len;
-	if (f_n + FAST_PAY > NETRING_CHUNK || (len & 15)) { // full (or a short datagram: only the last one is)
+	// full, or a short datagram: the sender has no more for now (a live picture's end, or the stream's), so what is
+	// here goes to the EE at once instead of waiting for 32 KB. The sender keeps those ends on multiples of 16 bytes
+	if (f_n + FAST_PAY > NETRING_CHUNK || len < FAST_PAY) {
 		f_ready[f_cur] = f_n, f_n = 0;
 		if (!f_ready[f_cur ^ 1]) f_cur ^= 1;
 		else f_stalled = 1;

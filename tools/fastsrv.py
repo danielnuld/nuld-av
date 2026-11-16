@@ -15,7 +15,9 @@ PAY = 1408
 
 
 def serve(port, open_stream, name="fast"):
-    """open_stream(what) -> a function read(n) giving the next n bytes (b"" at the end), or None to refuse."""
+    """open_stream(what) -> the stream, or None to refuse: a function read(n), or an object with read(n) and, if
+    it likes, close(). read gives the next bytes: n of them; fewer when it wants the PS2 to have them at once (a live
+    picture's end: keep those on multiples of 16 bytes of the stream); None for nothing yet; b"" at the end."""
     threading.Thread(target=_run, args=(port, open_stream, name), daemon=True).start()
 
 
@@ -59,7 +61,8 @@ def _run(port, open_stream, name):
 
 class _Client:
     def __init__(self, addr, rate, read, now):
-        self.addr, self.rate, self.read = addr, rate, read
+        self.addr, self.rate = addr, rate
+        self.read, self.close = getattr(read, "read", read), getattr(read, "close", None)
         self.base = self.next = 0  # what it wants; what we send next
         self.window, self.out, self.first = 32, {}, 0  # the datagrams from base on, kept to send again
         self.end = None  # the end marker's sequence, once the stream ran out
@@ -93,6 +96,8 @@ class _Client:
             if self.end is not None:
                 return None
             data = self.read(PAY)
+            if data is None:
+                return None  # live: nothing to send yet
             if not data:
                 self.end = seq
                 self.out[seq] = b"PE" + struct.pack("<I", seq)
@@ -133,6 +138,8 @@ class _Client:
         return did
 
     def report(self, name):
+        if self.close:
+            self.close()
         dt = max(time.perf_counter() - self.t0, 1e-3)
         print(f"{self.addr[0]}: {name} asked {self.rate >> 10} KB/s: it took {self.base} datagrams in {dt:.1f} s = "
               f"{self.base * PAY / 1024 / dt:.0f} KB/s; {self.total} sent, sent again from a gap {self.again} times, "

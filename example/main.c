@@ -16,6 +16,7 @@
 #include <sbv_patches.h>
 #include <sifrpc.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
@@ -107,7 +108,8 @@ int main(void)
 	int r = nav_net_open(aton(srv), 8091, 2600, &src);
 	if (r < 0) snprintf(line, sizeof line, "no stream from %s:8091 (tools/avsrv.py): %d\n", srv, r);
 	else {
-		r = nav_play(&src, logline, &st);
+		// [link] vivo = 1: the PC's screen from tools/livesrv.py, shown as it comes; else a video from tools/avsrv.py
+		r = (atoi(ini_get(&cfg, "link", "vivo", "0")) ? nav_play_live : nav_play)(&src, logline, &st);
 		snprintf(line, sizeof line, "nav_play %d: %d of %d pictures shown, %d dropped, %d late; %u datagrams sent again\n", r,
 		         st.shown, st.pictures, st.dropped, st.late, nav_net_gaps());
 		nav_net_close();

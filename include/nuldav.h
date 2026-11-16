@@ -36,6 +36,11 @@ typedef struct nav_stats {
 // -4 the GS's memory, -5 the IPU refused a picture.
 int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *out);
 
+// The same for a live stream (a PC's screen: tools/livesrv.py): nothing is buffered and there is no clock, every
+// picture is shown as soon as it is decoded and an older one still waiting is dropped for it. No sound: the
+// stream's 'A' chunks are ignored and audsrv is left alone, for the program to play its own.
+int nav_play_live(const nav_source *src, void (*log)(const char *line), nav_stats *out);
+
 // Ends a nav_play under way, from another thread or an interrupt handler.
 void nav_stop(void);
 

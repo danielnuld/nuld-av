@@ -48,6 +48,7 @@ static void nlog(const char *fmt, ...)
 }
 
 static volatile int stop, eof; // eof: the source ended (2: it was not a PS2V stream)
+static int live;               // nav_play_live: no buffering, no clock, no sound
 static nav_source source;
 
 // ---- the audio ring: one writer, one reader, free-running counters, a power-of-two size ----
@@ -114,7 +115,7 @@ static void feed(const u8 *p, u32 n)
 			continue;
 		}
 		u32 k = ck.left < n ? ck.left : n;
-		if (ck.type == 'A') ring_put(&aring, p, k);
+		if (ck.type == 'A' && !live) ring_put(&aring, p, k);
 		else if (ck.type == 'V') memcpy(ck.dst, p, k), ck.dst += k;
 		p += k, n -= k, ck.left -= k;
 		if (!ck.left && ck.type == 'V') {
@@ -452,7 +453,14 @@ static void presenter(void *u)
 	while (!pr_stop) {
 		WaitSema(vs_sema);
 		u32 vs = vs_at, b0 = cycles();
-		if (q_rd < q_wr) {
+		if (live && q_rd < q_wr) { // the newest picture, now; older ones still waiting are dropped for it
+			int k = q_wr - 1;
+			dropped += k - q_rd, d_k = k;
+			draw_behind_beam(q_frame[k % PSV_FRAMES], vs);
+			u32 dt = cycles() - b0;
+			if (dt > draw_max) draw_max = dt;
+			shown++, q_rd = k + 1;
+		} else if (q_rd < q_wr) {
 			int k = q_rd;
 			long long now = clock90(pr_wall0), due = k * pr_dur, refresh = 90000LL * 1001 / 60000, behind = now - due;
 			// too late: dropped, when a newer picture is there to show instead (or very late: the sound runs on).
@@ -472,6 +480,7 @@ static void presenter(void *u)
 	ExitThread();
 }
 
+static u32 dec_cyc; // what the last picture took to decode
 static void *next_picture(void) // the queue's next picture decoded; NULL at the end (or the IPU's refusal: eof 3)
 {
 	while (pq_rd == pq_wr) {
@@ -481,7 +490,9 @@ static void *next_picture(void) // the queue's next picture decoded; NULL at the
 	u32 i = pq_rd % PQ;
 	const u8 *p = vbuf + pq_off[i];
 	const psv_pic *h = (const psv_pic *)p;
+	u32 t = cycles();
 	void *f = psv_picture(h, p + 16, p + 16 + h->side);
+	dec_cyc = cycles() - t;
 	if (!f) eof = 3;
 	pv_rtot += pq_len[i], pq_rd++;
 	return f;
@@ -489,7 +500,11 @@ static void *next_picture(void) // the queue's next picture decoded; NULL at the
 
 void nav_stop(void) { stop = 1; }
 
-int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *out)
+static int play(const nav_source *src, void (*log)(const char *line), nav_stats *out);
+int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *out) { return live = 0, play(src, log, out); }
+int nav_play_live(const nav_source *src, void (*log)(const char *line), nav_stats *out) { return live = 1, play(src, log, out); }
+
+static int play(const nav_source *src, void (*log)(const char *line), nav_stats *out)
 {
 	int ret = 0, dtid = -1, atid = -1, ptid = -1, vsh = -1, decoded = 0, a_started = 0;
 	ee_thread_status_t me;
@@ -505,14 +520,16 @@ int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *ou
 	chain = memalign(64, (80 * 45 * 3 * 6 + 12 * 144 + 16) * 16); // 720p: 3600 macroblocks x 3 planes, 12 bands
 	ref_at = malloc(80 * 45 * 3 * 4), ref_off = malloc(80 * 45 * 3 * 4);
 	if (!vbuf || !aring.b || !chain || !ref_at || !ref_off) { ret = -2; goto end; }
-	audsrv_init();
+	if (!live) audsrv_init();
 
 	ee_thread_t dt = {.func = demux, .stack = demux_stack, .stack_size = sizeof demux_stack, .gp_reg = &_gp, .initial_priority = 0x30};
 	ee_thread_t at = {.func = audio, .stack = audio_stack, .stack_size = sizeof audio_stack, .gp_reg = &_gp, .initial_priority = 0x28};
-	dtid = CreateThread(&dt), atid = CreateThread(&at);
+	dtid = CreateThread(&dt);
+	if (!live) atid = CreateThread(&at);
 	StartThread(dtid, NULL);
-	// prebuffer: PREBUF of video or the audio ring 3/4 full, 15 s at most
-	for (int t = 0; t < 1500 && (int)(pv_wtot - pv_rtot) < PREBUF && ring_used(&aring) < ABUF * 3 / 4 && !eof && !stop; t++) usleep(10000);
+	// prebuffer: PREBUF of video or the audio ring 3/4 full, 15 s at most. Live: only the first picture
+	for (int t = 0; t < 1500 && (int)(pv_wtot - pv_rtot) < (live ? 1 : PREBUF) && ring_used(&aring) < ABUF * 3 / 4 && !eof && !stop; t++)
+		usleep(10000);
 	if (eof == 2 || !s_pics) { ret = -1; goto end; }
 	nlog("nuld-av: %d pictures of %dx%d at %d/%d, prebuffered %d KB of video, %d KB of sound, %d KB/s in\n", s_pics, s_w, s_h,
 	     s_num, s_den, (int)(pv_wtot - pv_rtot) >> 10, ring_used(&aring) >> 10, in_kbs);
@@ -534,7 +551,7 @@ int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *ou
 	vsh = AddIntcHandler(INTC_VBLANK_S, vs_handler, 0);
 	EnableIntc(INTC_VBLANK_S);
 	// the sound starts with the first picture: started before the GS was set up, it ran ~150 ms ahead
-	StartThread(atid, NULL), a_started = 1;
+	if (!live) StartThread(atid, NULL), a_started = 1;
 
 	int n = 0, win = 0;
 	u32 dmax = 0, dsum = 0;
@@ -543,14 +560,19 @@ int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *ou
 	while (!stop) {
 		// decoding picture n + 1 rewrites the frame of n + 1 - PSV_FRAMES: drawn (or dropped) first
 		while (!stop && q_rd < n + 2 - PSV_FRAMES) usleep(1000);
-		u32 t = cycles();
 		if (!(f = next_picture())) break;
-		t = cycles() - t;
+		u32 t = dec_cyc; // the decoding alone: waiting for the picture to come is not it
 		decoded++, win++, dsum += t, dmax = t > dmax ? t : dmax, n++;
 		q_frame[n % PSV_FRAMES] = (u32)f;
 		__asm__ volatile("" ::: "memory");
 		q_wr = n + 1;
-		if (clock() - rep > 5 * CLOCKS_PER_SEC) {
+		if (live && clock() - rep > 5 * CLOCKS_PER_SEC) {
+			nlog("nuld-av live: %d shown, %d dropped; decoding %.1f ms a picture (worst %.1f), drawing up to %.1f ms; %d pictures"
+			     " waiting to be decoded (%d KB), %d KB/s in\n", shown, dropped, ms(dsum / win), ms(dmax), ms(draw_max),
+			     (int)(pq_wr - pq_rd), (int)(pv_wtot - pv_rtot) >> 10, in_kbs);
+			memset(psv_prof, 0, sizeof psv_prof);
+			draw_max = 0, win = 0, dsum = dmax = 0, rep = clock();
+		} else if (clock() - rep > 5 * CLOCKS_PER_SEC) {
 			nlog("nuld-av: %d shown, %d dropped, %d late; decoding %.1f ms a picture (worst %.1f: IPU wait %.1f, prediction %.1f,"
 			     " skipped %.1f, set up %.1f), drawing up to %.1f ms; sound - picture %+d ms; %d pictures ahead, %d KB of video"
 			     " buffered, %d KB/s in\n", shown, dropped, late, ms(dsum / win), ms(dmax), ms(psv_prof[0] / win),

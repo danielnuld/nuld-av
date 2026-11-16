@@ -8,7 +8,7 @@
 // and, if they are zero, goes looking for a start code; an intra macroblock can begin with 8 zero bits, the '1'
 // (skipped by BDEC's FB field) keeps that from ever happening.
 //
-// File: 64-byte header {"PSV0", u16 w, h, u32 pictures, u32 fps num, den}; per picture a 16-byte header
+// File: 64-byte header {"PSV1", u16 w, h, u32 pictures, u32 fps num, den}; per picture a 16-byte header
 // {u32 ipu bytes, u32 side bytes, u16 records, u8 type (1 I, 2 P), u8 flags (idp | qst << 2 | alt scan << 3 |
 // intra vlc << 4), u32 BDECs}, the side stream and the IPU stream, each padded to 16 bytes.
 // Record, 1 to 8 bytes: a byte {bit 0 intra, bit 1 pattern (either: the IPU decodes it), bits 2-3 mode, bit 4 a
@@ -18,29 +18,55 @@
 // {dx, dy: 4 bits each, signed}, 3 {s16 x, s16 y}. "The last record's" is zero after an intra record, a mode 0 one,
 // skipped macroblocks and at the picture's start. The quantiser holds from record to record.
 //
+// Streaming ("-" for both: stdin to stdout, behind a live encoder): each picture goes out the moment its last
+// macroblock is read, already as the player's stream (what tools/mkpsv.py writes to a .psm): once a 64-byte header
+// "psv 999999999 <fps num> <den> <w> <h>", then per picture a chunk {'V', 3 x 0, u32 bytes} + the picture and an
+// empty chunk {'P', 7 x 0}, which keeps every picture's end on a multiple of 16 bytes of the stream (the PS2's
+// network path hands over what it has there).
+//
 // usage: psvpack in.m2v out.psv [fps num den]
+//        psvpack - - [fps num den]
+#include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-static const uint8_t *B;
-static size_t N;
+static uint8_t *B;
+static size_t N, bcap;
 static uint64_t pos; // bits
+static int streaming;
+static jmp_buf starved; // streaming: the unit being read is not all here yet
 
 static void die(const char *what)
 {
+	// streaming: a code that makes no sense within reach of the data's end was read with the zeros peek() pads with
+	if (streaming && (pos >> 3) + 4 >= N) longjmp(starved, 1);
 	fprintf(stderr, "psvpack: %s at byte %llu bit %d\n", what, (unsigned long long)(pos >> 3), (int)(pos & 7));
 	exit(1);
 }
 static unsigned peek(int n) // n <= 24
 {
 	size_t by = pos >> 3;
+	// streaming: out of data when the first byte asked for is missing. The up to three after it read as zero, as
+	// they do at a file's end: a picture's last code (an end of block, '10') has nothing after it yet, and zeros
+	// can't complete a code that isn't whole (every code ends in a 1 or is followed by one that does)
+	if (streaming && by >= N) longjmp(starved, 1);
 	uint32_t v = 0;
 	for (int i = 0; i < 4; i++) v = v << 8 | (by + i < N ? B[by + i] : 0);
 	return (uint32_t)(v << (pos & 7)) >> (32 - n);
 }
 static unsigned get(int n) { unsigned v = n ? peek(n) : 0; pos += n; return v; }
+
+static int fill(void) // streaming: more from stdin; 0 at its end
+{
+	if (N + 65536 > bcap) B = realloc(B, bcap = bcap ? bcap * 2 : 1 << 20);
+	ssize_t r = read(0, B + N, 65536);
+	if (r <= 0) return 0;
+	N += r;
+	return 1;
+}
 
 static uint8_t *W; // the picture's IPU stream
 static uint64_t wpos;
@@ -180,158 +206,211 @@ static void dc(int chroma) // B-12, B-13 and the differential
 	pos += size;
 }
 
-static int next_start(void) // the next start code's value, pos after it; -1 at the end
+// the next start code at or after pos: its value, pos after it and *at where it starts; -1 if there is none (yet)
+static int find_start(size_t *at)
 {
-	size_t i = (pos + 7) >> 3;
-	for (; i + 4 <= N; i++)
-		if (!B[i] && !B[i + 1] && B[i + 2] == 1) { pos = (uint64_t)(i + 4) << 3; return B[i + 3]; }
+	for (size_t i = (pos + 7) >> 3; i + 4 <= N; i++)
+		if (!B[i] && !B[i + 1] && B[i + 2] == 1) { *at = i, pos = (uint64_t)(i + 4) << 3; return B[i + 3]; }
 	return -1;
+}
+
+enum { CAP = 4 << 20 };
+static FILE *o;
+static uint8_t *side;
+static uint32_t fps_num = 30000, fps_den = 1001, wmax = CAP;
+static uint64_t out_side, out_ipu, all_bdec, all_mb;
+static int pics;
+// what a unit read only in part must leave as it was (streaming)
+static struct state {
+	int w, h, mbw, mbh, pict, fcode[2], flags, open;
+	uint32_t ns, nrec, nbdec;
+	int last, total, sent_qs, rp[2]; // last coded macroblock's address; macroblocks seen; what the reader holds
+	uint64_t wpos;
+} S, saved;
+static size_t unit_at;
+
+static void emit(void) // the picture is whole: out it goes
+{
+	put(1, 1);
+	while (wpos & 7) put(1, 1);
+	uint32_t ni = wpos >> 3;
+	while (ni & 15) W[ni++] = 0xFF;
+	memset(W + ni, 0xFF, 16), ni += 16; // the IPU reads ahead of the last macroblock
+	while (S.ns & 15) side[S.ns++] = 0;
+	uint8_t ph[16];
+	uint16_t r16 = S.nrec;
+	memcpy(ph, &ni, 4), memcpy(ph + 4, &S.ns, 4), memcpy(ph + 8, &r16, 2);
+	ph[10] = S.pict, ph[11] = S.flags;
+	memcpy(ph + 12, &S.nbdec, 4);
+	if (streaming) {
+		uint8_t ck[8] = {'V'}, pad[8] = {'P'};
+		uint32_t n = 16 + S.ns + ni;
+		if (!pics) {
+			char hd[64] = {0};
+			snprintf(hd, sizeof hd, "psv 999999999 %u %u %d %d\n", fps_num, fps_den, S.w, S.h);
+			fwrite(hd, 1, 64, o);
+		}
+		memcpy(ck + 4, &n, 4);
+		fwrite(ck, 1, 8, o);
+		fwrite(ph, 1, 16, o), fwrite(side, 1, S.ns, o), fwrite(W, 1, ni, o);
+		fwrite(pad, 1, 8, o);
+		fflush(o);
+	} else
+		fwrite(ph, 1, 16, o), fwrite(side, 1, S.ns, o), fwrite(W, 1, ni, o);
+	out_side += S.ns, out_ipu += ni, all_bdec += S.nbdec, all_mb += S.total, pics++, S.open = 0;
+	wmax = ni + 64;
+}
+
+static void unit(int code)
+{
+	if (code == 0xB3) { // sequence header
+		S.w = get(12), S.h = get(12);
+		get(8), get(18), get(1), get(10), get(1);
+		if (get(1)) die("custom intra matrix: not handled yet");
+		if (get(1)) die("custom non-intra matrix: not handled yet");
+		S.mbw = (S.w + 15) / 16, S.mbh = (S.h + 15) / 16;
+	} else if (code == 0xB5) { // extensions
+		int id = get(4);
+		if (id == 1) {
+			get(8);
+			if (!get(1)) die("not a progressive sequence");
+		} else if (id == 3) die("quant matrix extension: not handled yet");
+		else if (id == 8) {
+			int f0 = get(4), f1 = get(4);
+			get(8);
+			int idp = get(2), ps = get(2);
+			get(1);
+			int fpfd = get(1), cmv = get(1), qst = get(1), ivf = get(1), as = get(1);
+			if (ps != 3 || !fpfd || cmv) die("only frame pictures with frame_pred_frame_dct and no concealment vectors");
+			if (ivf) die("intra_vlc_format 1 (table B-15): not handled yet");
+			S.fcode[0] = f0, S.fcode[1] = f1, S.flags = idp | qst << 2 | as << 3 | ivf << 4;
+		}
+	} else if (code == 0x00) { // picture header
+		get(10);
+		int pict = get(3);
+		if (pict != 1 && pict != 2) die("only I and P pictures");
+		memset(W, 0, wmax);
+		wpos = 0;
+		S.pict = pict, S.ns = S.nrec = S.nbdec = 0, S.last = -1, S.total = 0, S.open = 1, S.sent_qs = -1, S.rp[0] = S.rp[1] = 0;
+	} else if (code >= 1 && code <= 0xAF && S.open) { // a slice
+		int qs = get(5);
+		if (get(1)) { get(8); while (get(1)) get(8); }
+		int mba = (code - 1) * S.mbw + mbai() - 1, pmv[2] = {0, 0}, prev_intra = 0;
+		for (;;) {
+			if (mba >= S.mbw * S.mbh) die("macroblock address past the picture");
+			int t = mbtype(S.pict), mv[2] = {0, 0};
+			if (t & QUANT) qs = get(5);
+			if (t & MOTION) {
+				mv[0] = pmv[0] = mvdec(pmv[0], S.fcode[0]);
+				mv[1] = pmv[1] = mvdec(pmv[1], S.fcode[1]);
+			}
+			uint64_t from = pos;
+			if (t & INTRA) {
+				pmv[0] = pmv[1] = 0;
+				for (int b = 0; b < 6; b++) dc(b >= 4), coefs(0);
+			} else if (t & PATTERN) {
+				for (int c = cbp(); c; c &= c - 1) coefs(1);
+			}
+			if (S.pict == 2 && !(t & (MOTION | INTRA))) pmv[0] = pmv[1] = 0;
+			if (S.ns + 8 > CAP || (wpos >> 3) + 4096 > CAP) die("picture too large");
+			uint16_t skip = mba - S.last - 1;
+			uint8_t *r = side + S.ns++;
+			*r = (t & (INTRA | PATTERN)) | (skip < 7 ? skip : 7) << 5;
+			if (skip >= 7) memcpy(side + S.ns, &skip, 2), S.ns += 2;
+			if ((t & (INTRA | PATTERN)) && qs != S.sent_qs) *r |= 16, side[S.ns++] = S.sent_qs = qs;
+			if (skip) S.rp[0] = S.rp[1] = 0;
+			if (t & INTRA) {
+				if (!prev_intra) *r |= 4;
+				S.rp[0] = S.rp[1] = 0;
+			} else if (!(t & MOTION)) S.rp[0] = S.rp[1] = 0; // mode 0
+			else {
+				int dx = mv[0] - S.rp[0], dy = mv[1] - S.rp[1];
+				if (!dx && !dy) *r |= 1 << 2;
+				else if (dx >= -8 && dx < 8 && dy >= -8 && dy < 8) *r |= 2 << 2, side[S.ns++] = (dx & 15) | (dy & 15) << 4;
+				else {
+					int16_t m[2] = {mv[0], mv[1]};
+					*r |= 3 << 2, memcpy(side + S.ns, m, 4), S.ns += 4;
+				}
+				S.rp[0] = mv[0], S.rp[1] = mv[1];
+			}
+			S.nrec++;
+			if (t & (INTRA | PATTERN)) {
+				put(1, 1);
+				uint64_t save = pos;
+				for (pos = from; pos < save;) {
+					int k = save - pos > 24 ? 24 : (int)(save - pos);
+					put(get(k), k);
+				}
+				S.nbdec++;
+			}
+			S.total += mba - S.last, S.last = mba, prev_intra = t & INTRA;
+			if (S.total == S.mbw * S.mbh) { emit(); return; } // the picture's last macroblock: nothing after it yet
+			if (streaming && (pos >> 3) + 3 > N) longjmp(starved, 1); // the 23 bits below must be the stream's own
+			if (!peek(23)) break; // the slice ends
+			int inc = mbai();
+			if (inc > 1) pmv[0] = pmv[1] = 0, prev_intra = 0;
+			mba += inc;
+		}
+	}
 }
 
 int main(int argc, char **argv)
 {
-	if (argc < 3) { fprintf(stderr, "usage: psvpack in.m2v out.psv [fps num den]\n"); return 1; }
-	FILE *f = fopen(argv[1], "rb");
-	if (!f) { perror(argv[1]); return 1; }
-	fseek(f, 0, SEEK_END);
-	N = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	uint8_t *in = malloc(N + 8);
-	if (fread(in, 1, N, f) != N) return 1;
-	fclose(f);
-	memset(in + N, 0, 8);
-	B = in;
-	FILE *o = fopen(argv[2], "wb");
-	if (!o) { perror(argv[2]); return 1; }
+	if (argc < 3) { fprintf(stderr, "usage: psvpack in.m2v out.psv [fps num den]   (- - : stdin to stdout, streaming)\n"); return 1; }
+	streaming = !strcmp(argv[1], "-");
+	if (argc > 4) fps_num = atoi(argv[3]), fps_den = atoi(argv[4]);
 	uint8_t head[64] = "PSV1";
-	fwrite(head, 1, 64, o);
-
-	int w = 0, h = 0, mbw = 0, mbh = 0, pict = 0, fcode[2] = {0}, flags = 0, pics = 0;
-	enum { CAP = 4 << 20 };
-	W = malloc(CAP);
-	uint8_t *side = malloc(CAP);
-	uint32_t ns = 0, nrec = 0, nbdec = 0;
-	int last = -1, total = 0, open = 0; // last coded macroblock's address; macroblocks seen; a picture being written
-	int sent_qs = -1, rp[2] = {0, 0}; // the quantiser and vector the reader holds
-	uint64_t in_bits = 0, out_side = 0, out_ipu = 0, all_bdec = 0, all_mb = 0;
-	for (;;) {
-		int code = next_start();
-		if (open && (code <= 0 || code == 0xB3 || code == 0xB7 || code == 0xB8)) { // the picture ends: written out
-			if (total != mbw * mbh) die("picture without all its macroblocks");
-			put(1, 1);
-			while (wpos & 7) put(1, 1);
-			uint32_t ni = wpos >> 3;
-			while (ni & 15) W[ni++] = 0xFF;
-			memset(W + ni, 0xFF, 16), ni += 16; // the IPU reads ahead of the last macroblock
-			while (ns & 15) side[ns++] = 0;
-			uint8_t ph[16];
-			memcpy(ph, &ni, 4), memcpy(ph + 4, &ns, 4);
-			uint16_t r16 = nrec;
-			memcpy(ph + 8, &r16, 2);
-			ph[10] = pict, ph[11] = flags;
-			memcpy(ph + 12, &nbdec, 4);
-			fwrite(ph, 1, 16, o), fwrite(side, 1, ns, o), fwrite(W, 1, ni, o);
-			out_side += ns, out_ipu += ni, all_bdec += nbdec, all_mb += total, pics++, open = 0;
-		}
-		if (code < 0) break;
-		if (code == 0xB3) { // sequence header
-			w = get(12), h = get(12);
-			get(8), get(18), get(1), get(10), get(1);
-			if (get(1)) die("custom intra matrix: not handled yet");
-			if (get(1)) die("custom non-intra matrix: not handled yet");
-			mbw = (w + 15) / 16, mbh = (h + 15) / 16;
-		} else if (code == 0xB5) { // extensions
-			int id = get(4);
-			if (id == 1) {
-				get(8);
-				if (!get(1)) die("not a progressive sequence");
-			} else if (id == 3) die("quant matrix extension: not handled yet");
-			else if (id == 8) {
-				fcode[0] = get(4), fcode[1] = get(4);
-				get(8);
-				int idp = get(2), ps = get(2);
-				get(1);
-				int fpfd = get(1), cmv = get(1), qst = get(1), ivf = get(1), as = get(1);
-				if (ps != 3 || !fpfd || cmv) die("only frame pictures with frame_pred_frame_dct and no concealment vectors");
-				if (ivf) die("intra_vlc_format 1 (table B-15): not handled yet");
-				flags = idp | qst << 2 | as << 3 | ivf << 4;
-			}
-		} else if (code == 0x00) { // picture header
-			get(10);
-			pict = get(3);
-			if (pict != 1 && pict != 2) die("only I and P pictures");
-			memset(W, 0, CAP);
-			wpos = 0, ns = nrec = nbdec = 0, last = -1, total = 0, open = 1, sent_qs = -1, rp[0] = rp[1] = 0;
-			in_bits = pos;
-		} else if (code >= 1 && code <= 0xAF && open) { // a slice
-			int qs = get(5);
-			if (get(1)) { get(8); while (get(1)) get(8); }
-			int mba = (code - 1) * mbw + mbai() - 1, pmv[2] = {0, 0}, prev_intra = 0;
-			for (;;) {
-				if (mba >= mbw * mbh) die("macroblock address past the picture");
-				int t = mbtype(pict), mv[2] = {0, 0};
-				if (t & QUANT) qs = get(5);
-				if (t & MOTION) {
-					mv[0] = pmv[0] = mvdec(pmv[0], fcode[0]);
-					mv[1] = pmv[1] = mvdec(pmv[1], fcode[1]);
-				}
-				uint64_t from = pos;
-				if (t & INTRA) {
-					pmv[0] = pmv[1] = 0;
-					for (int b = 0; b < 6; b++) dc(b >= 4), coefs(0);
-				} else if (t & PATTERN) {
-					for (int c = cbp(); c; c &= c - 1) coefs(1);
-				}
-				if (pict == 2 && !(t & (MOTION | INTRA))) pmv[0] = pmv[1] = 0;
-				if (ns + 8 > CAP || (wpos >> 3) + 4096 > CAP) die("picture too large");
-				uint16_t skip = mba - last - 1;
-				uint8_t *r = side + ns++;
-				*r = (t & (INTRA | PATTERN)) | (skip < 7 ? skip : 7) << 5;
-				if (skip >= 7) memcpy(side + ns, &skip, 2), ns += 2;
-				if ((t & (INTRA | PATTERN)) && qs != sent_qs) *r |= 16, side[ns++] = sent_qs = qs;
-				if (skip) rp[0] = rp[1] = 0;
-				if (t & INTRA) {
-					if (!prev_intra) *r |= 4;
-					rp[0] = rp[1] = 0;
-				} else if (!(t & MOTION)) rp[0] = rp[1] = 0; // mode 0
-				else {
-					int dx = mv[0] - rp[0], dy = mv[1] - rp[1];
-					if (!dx && !dy) *r |= 1 << 2;
-					else if (dx >= -8 && dx < 8 && dy >= -8 && dy < 8) *r |= 2 << 2, side[ns++] = (dx & 15) | (dy & 15) << 4;
-					else {
-						int16_t m[2] = {mv[0], mv[1]};
-						*r |= 3 << 2, memcpy(side + ns, m, 4), ns += 4;
-					}
-					rp[0] = mv[0], rp[1] = mv[1];
-				}
-				nrec++;
-				if (t & (INTRA | PATTERN)) {
-					put(1, 1);
-					uint64_t save = pos;
-					for (pos = from; pos < save;) {
-						int k = save - pos > 24 ? 24 : (int)(save - pos);
-						put(get(k), k);
-					}
-					nbdec++;
-				}
-				total += mba - last, last = mba, prev_intra = t & INTRA;
-				if (!peek(23)) break; // the slice ends
-				int inc = mbai();
-				if (inc > 1) pmv[0] = pmv[1] = 0, prev_intra = 0;
-				mba += inc;
-			}
-		}
+	if (streaming) o = stdout;
+	else {
+		FILE *f = fopen(argv[1], "rb");
+		if (!f) { perror(argv[1]); return 1; }
+		fseek(f, 0, SEEK_END);
+		N = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		B = malloc(N + 8);
+		if (fread(B, 1, N, f) != N) return 1;
+		fclose(f);
+		memset(B + N, 0, 8);
+		o = fopen(argv[2], "wb");
+		if (!o) { perror(argv[2]); return 1; }
+		fwrite(head, 1, 64, o);
 	}
-	uint16_t w16 = w, h16 = h;
-	uint32_t p32 = pics, num = argc > 4 ? atoi(argv[3]) : 30000, den = argc > 4 ? atoi(argv[4]) : 1001;
+	W = malloc(CAP + 64), side = malloc(CAP);
+	for (;;) {
+		if (streaming && (pos >> 3) > (4u << 20)) { // what was read, dropped
+			size_t k = pos >> 3;
+			memmove(B, B + k, N - k), N -= k, pos -= (uint64_t)k << 3;
+		}
+		int code = find_start(&unit_at);
+		if (code < 0) {
+			if (streaming && fill()) continue;
+			break;
+		}
+		if (S.open && (code == 0 || code == 0xB3 || code == 0xB7 || code == 0xB8)) die("picture without all its macroblocks");
+		saved = S, saved.wpos = wpos;
+		if (streaming && setjmp(starved)) { // the unit was not all here: as it was, and again with more
+			if (wpos > saved.wpos) {
+				size_t a = saved.wpos >> 3, b = (wpos + 7) >> 3;
+				W[a] &= (uint8_t)~(0xFF >> (saved.wpos & 7));
+				if (b > a + 1) memset(W + a + 1, 0, b - a - 1);
+			}
+			S = saved, wpos = saved.wpos, pos = (uint64_t)unit_at << 3;
+			if (!fill()) break;
+			continue;
+		}
+		unit(code);
+	}
+	if (S.open) die("the last picture is not whole");
+	if (streaming) return 0;
+	uint16_t w16 = S.w, h16 = S.h;
+	uint32_t p32 = pics;
 	memcpy(head + 4, &w16, 2), memcpy(head + 6, &h16, 2), memcpy(head + 8, &p32, 4);
-	memcpy(head + 12, &num, 4), memcpy(head + 16, &den, 4);
+	memcpy(head + 12, &fps_num, 4), memcpy(head + 16, &fps_den, 4);
 	fseek(o, 0, SEEK_SET);
 	fwrite(head, 1, 64, o);
 	fclose(o);
-	(void)in_bits;
 	printf("%dx%d, %d pictures: %zu bytes of MPEG-2 -> side %llu + IPU %llu = %llu bytes; %.0f%% of macroblocks need the IPU\n",
-	       w, h, pics, N, (unsigned long long)out_side, (unsigned long long)out_ipu,
+	       S.w, S.h, pics, N, (unsigned long long)out_side, (unsigned long long)out_ipu,
 	       (unsigned long long)(out_side + out_ipu + 16ull * pics + 64), all_mb ? 100.0 * all_bdec / all_mb : 0.0);
 	return 0;
 }

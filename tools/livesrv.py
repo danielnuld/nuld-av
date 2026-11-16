@@ -45,8 +45,9 @@ def audio_feed(live):
 
 # Pictures made and not yet taken by the PS2 before they are given up: its network or its decoder is not keeping up,
 # and everything behind them (the sound too) would come out that much late, later and later. They are dropped, the
-# capture starts again (its first picture is a whole one: nothing after it needs the dropped ones) at 3/4 of the bit
-# rate. 6 pictures: 200 ms
+# capture starts again (its first picture is a whole one: nothing after it needs the dropped ones). The bit rate
+# stays: on the console these were hiccups of the network at a tenth of what it carries, and 3/4 less each time
+# left the picture at 3 Mbit/s for nothing. 6 pictures: 200 ms
 BEHIND = 6
 
 
@@ -63,7 +64,6 @@ class Live:
         self.units, self.cur, self.at, self.ended, self.closed = collections.deque(), b"", 0, False, False
         self.lock = threading.Lock()
         self.made = self.most = self.starts = self.vwait = self.flushed = 0
-        self.scale = 1.0  # of the asked bit rate: down each time the PS2 could not keep up
         self.t0 = self.last = time.time()
         self.ffmpeg = self.pack = None
         threading.Thread(target=self.reader, daemon=True).start()
@@ -87,13 +87,16 @@ class Live:
             # stream back for the other, and the pictures left in bursts paced by the audio frames
             arate = getattr(a, "audio_rate", "192k")
             frame = int(arate.rstrip("kK")) * 1000 * 1152 // 48000 // 8
-            grab += ["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0"]
-            aout = ["-map", "1:a", "-c:a", "mp2", "-b:a", arate, "-f", "mp2",
+            # 48000 Hz declared as 4000 and set right by asetrate: ffmpeg cuts raw audio into packets of about a tenth
+            # of a second, and the MP2 frames left four at a time every 90 ms (measured; 20-30 ms apart like this).
+            # The PS2 holds ~100 ms of sound: it ran dry and then had too much, twice a second
+            grab += ["-f", "s16le", "-ar", "4000", "-ac", "2", "-i", "pipe:0"]
+            aout = ["-map", "1:a", "-af", "asetrate=48000", "-c:a", "mp2", "-b:a", arate, "-f", "mp2",
                     f"udp://127.0.0.1:{self.asock.getsockname()[1]}?pkt_size={frame}"]
         # no B pictures (nothing to reorder), each picture written out as it is coded. A whole picture only every ten
         # seconds: it is ~100 KB, 40 ms and more on the PS2's network, and nothing is lost on the way that it would
         # have to repair (cuts get their own). The rate control's buffer is small: no picture much over its share
-        bits = int(float(a.rate.rstrip("M")) * 1e6 * self.scale)
+        bits = int(float(a.rate.rstrip("M")) * 1e6)
         rate = ["-b:v", str(bits), "-maxrate", str(bits), "-bufsize", str(bits // 4)]
         if getattr(a, "encoder", "mpeg2video") == "mpeg2_qsv":
             # Intel's hardware encoder: the CPU is the game's. async_depth 1: it hands a picture back before it takes
@@ -155,12 +158,10 @@ class Live:
                             if late:  # see BEHIND
                                 self.units.clear()
                                 self.vwait, self.flushed = 0, self.flushed + 1
-                                self.scale = max(0.25, self.scale * 0.75)
                         self.last = time.time()
                         unit = b""
                         if late:
-                            print(f"live: the PS2 was {BEHIND} pictures behind: they are dropped and the capture goes on "
-                                  f"at {self.scale * float(self.a.rate.rstrip('M')):.1f} Mbit/s", flush=True)
+                            print(f"live: the PS2 was {BEHIND} pictures behind: they are dropped", flush=True)
                             raise EOFError
             except (EOFError, OSError, ValueError):
                 pass

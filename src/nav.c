@@ -492,8 +492,12 @@ static void presenter(void *u)
 static u32 dec_cyc; // what the last picture took to decode
 static void *next_picture(void) // the queue's next picture decoded; NULL at the end (or the IPU's refusal: eof 3)
 {
+	clock_t since = clock();
 	while (pq_rd == pq_wr) {
 		if (eof || stop) return NULL;
+		// live: 10 s without a picture and the sender is gone (its server stopped, the network fell): the end,
+		// not its last picture for ever (console, 2026-11-16). A still screen is sent all the same, 30 a second
+		if (live && clock() - since > 10 * CLOCKS_PER_SEC) return NULL;
 		usleep(live ? 500 : 1000);
 	}
 	u32 i = pq_rd % PQ;

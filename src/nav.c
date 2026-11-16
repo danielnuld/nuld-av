@@ -459,8 +459,11 @@ static void presenter(void *u)
 	while (!pr_stop) {
 		WaitSema(vs_sema);
 		u32 vs = vs_at, b0 = cycles();
-		if (live && q_rd < q_wr) { // the newest picture, now; older ones still waiting are dropped for it
-			int k = q_wr - 1;
+		if (live && q_rd < q_wr) {
+			// the oldest waiting, unless three or more are: then the last but one, the rest dropped. Two that came
+			// together go out one refresh apart instead of one being dropped: under load the PC's capture gives its
+			// 30 pictures a second in clumps, and "always the newest" showed 22 of them (console, a game, 2026-11-15)
+			int k = q_wr - q_rd >= 3 ? q_wr - 2 : q_rd;
 			dropped += k - q_rd, d_k = k;
 			draw_behind_beam(q_frame[k % PSV_FRAMES], vs);
 			u32 dt = cycles() - b0;

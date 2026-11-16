@@ -34,7 +34,19 @@ example/netring_irx.c: iop/netring/netring.irx
 iop/netring/netring.irx: iop/netring/netring.c include/netring.h
 	$(MAKE) -C iop/netring
 
+# what a program needs without building this: the library, its header, the IOP module, the example and the PC tools
+VERSION ?= 0.1.0
+dist: all
+	rm -rf dist/nuld-av-$(VERSION) && mkdir -p dist/nuld-av-$(VERSION)/lib dist/nuld-av-$(VERSION)/irx dist/nuld-av-$(VERSION)/example
+	cp -r include tools README.md dist/nuld-av-$(VERSION)/
+	rm -rf dist/nuld-av-$(VERSION)/tools/__pycache__ dist/nuld-av-$(VERSION)/tools/psvpack
+	cp $(EE_LIB) dist/nuld-av-$(VERSION)/lib/
+	cp iop/netring/netring.irx dist/nuld-av-$(VERSION)/irx/
+	cp example/nuldav.elf example/main.c dist/nuld-av-$(VERSION)/example/
+	cd dist && rm -f nuld-av-$(VERSION).zip && python3 -m zipfile -c nuld-av-$(VERSION).zip nuld-av-$(VERSION)
+
 clean:
+	rm -rf dist
 	rm -f $(EE_LIB) src/*.o example/*.o example/*_irx.c example/*.elf
 	$(MAKE) -C iop/netring clean
 

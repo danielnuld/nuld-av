@@ -36,7 +36,8 @@ static int pull(void *user, const unsigned char **data)
 	return n;
 }
 
-int nav_net_open(unsigned int ip, int port, int kbs, nav_source *src)
+// the stream started with one of two requests (the second, if any, when the IOP refuses the first)
+static int start(unsigned int ip, int port, const char *req, const char *or_req, nav_source *src)
 {
 	if (!cd.server) {
 		for (int i = 0; i < 1000 && !cd.server; i++) {
@@ -51,22 +52,34 @@ int nav_net_open(unsigned int ip, int port, int kbs, nav_source *src)
 	s.ip = ip, s.port = (port >> 8 & 255) | (port & 255) << 8;
 	s.ring = (u32)ring & 0x1fffffff, s.size = sizeof ring, s.status = (u32)st_mem & 0x1fffffff;
 	ST->write = 0, ST->done = 0, ST->err = 0, rd = acked = 0;
-	// the fast path; plain TCP if the module can't hook the Ethernet driver (smap.irx instead of the modular one)
-	// The number at the end tells this request from the last one's repeats: the IOP says it again until the stream
-	// starts, and the server must not take those for a new stream
-	u32 once;
-	__asm__ volatile("mfc0 %0, $9" : "=r"(once));
-	snprintf(s.req, sizeof s.req, "fast %d play %u\n", kbs, once);
+	snprintf(s.req, sizeof s.req, "%s", req);
 	memcpy(buf, &s, sizeof s);
 	int r = call(NR_START, sizeof s);
-	if (r < 0) {
-		strcpy(s.req, "play\n");
+	if (r < 0 && or_req) {
+		snprintf(s.req, sizeof s.req, "%s", or_req);
 		memcpy(buf, &s, sizeof s);
 		r = call(NR_START, sizeof s);
 	}
 	if (r < 0) return -2; // nobody answers there
 	open_ = 1, src->pull = pull, src->user = NULL;
 	return 0;
+}
+
+int nav_net_open(unsigned int ip, int port, int kbs, nav_source *src)
+{
+	// the fast path; plain TCP if the module can't hook the Ethernet driver (smap.irx instead of the modular one).
+	// The number at the end tells this request from the last one's repeats: the IOP says it again until the stream
+	// starts, and the server must not take those for a new stream
+	char req[44];
+	u32 once;
+	__asm__ volatile("mfc0 %0, $9" : "=r"(once));
+	snprintf(req, sizeof req, "fast %d play %u\n", kbs, once);
+	return start(ip, port, req, "play\n", src);
+}
+
+int nav_net_tcp(unsigned int ip, int port, const char *req, nav_source *src)
+{
+	return start(ip, port, req, NULL, src);
 }
 
 void nav_net_close(void)

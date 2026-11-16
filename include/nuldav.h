@@ -41,6 +41,10 @@ int nav_play(const nav_source *src, void (*log)(const char *line), nav_stats *ou
 // stream's 'A' chunks are ignored and audsrv is left alone, for the program to play its own.
 int nav_play_live(const nav_source *src, void (*log)(const char *line), nav_stats *out);
 
+// The live stream's sound, if it has any ('A' chunks: MP2 frames as the server sent them), handed to the program as
+// it comes, on the player's thread: copy it and return. NULL for none (the default).
+void nav_live_audio(void (*got)(const unsigned char *data, int n));
+
 // Ends a nav_play under way, from another thread or an interrupt handler.
 void nav_stop(void);
 
@@ -48,6 +52,10 @@ void nav_stop(void);
 // netring.irx's fast path, UDP taken at the Ethernet driver, at up to kbs KB/s (2600 is what a SCPH-75001 took
 // without trouble), or by TCP if the driver can't be hooked. 0 and src filled in, or negative.
 int nav_net_open(unsigned int ip, int port, int kbs, nav_source *src);
+// Any TCP server through netring.irx: connects, sends req (at most 43 characters, not starting with 'f') and gives
+// what comes until the server closes. For the small things a program fetches around a stream, an HTTP/1.0 GET for
+// one, without a second network stack on the EE. One stream at a time: this or nav_net_open.
+int nav_net_tcp(unsigned int ip, int port, const char *req, nav_source *src);
 void nav_net_close(void);
 unsigned int nav_net_gaps(void); // datagrams that had to be sent again so far (0 over TCP)
 

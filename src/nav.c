@@ -49,6 +49,8 @@ static void nlog(const char *fmt, ...)
 
 static volatile int stop, eof; // eof: the source ended (2: it was not a PS2V stream)
 static int live;               // nav_play_live: no buffering, no clock, no sound
+static void (*live_audio)(const unsigned char *, int);
+void nav_live_audio(void (*got)(const unsigned char *data, int n)) { live_audio = got; }
 static nav_source source;
 
 // ---- the audio ring: one writer, one reader, free-running counters, a power-of-two size ----
@@ -118,7 +120,8 @@ static void feed(const u8 *p, u32 n)
 			continue;
 		}
 		u32 k = ck.left < n ? ck.left : n;
-		if (ck.type == 'A' && !live) ring_put(&aring, p, k);
+		if (ck.type == 'A' && live) { if (live_audio) live_audio(p, k); }
+		else if (ck.type == 'A') ring_put(&aring, p, k);
 		else if (ck.type == 'V') memcpy(ck.dst, p, k), ck.dst += k;
 		p += k, n -= k, ck.left -= k;
 		if (!ck.left && ck.type == 'V') {

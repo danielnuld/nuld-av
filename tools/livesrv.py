@@ -46,8 +46,10 @@ def audio_feed(live):
 # and everything behind them (the sound too) would come out that much late, later and later. They are dropped, the
 # capture starts again (its first picture is a whole one: nothing after it needs the dropped ones). The bit rate
 # stays: on the console these were hiccups of the network at a tenth of what it carries, and 3/4 less each time
-# left the picture at 3 Mbit/s for nothing. 6 pictures: 200 ms
-BEHIND = 6
+# left the picture at 3 Mbit/s for nothing. 20 pictures, 2/3 s: at 6 it fired on the clumps a busy PC makes (the
+# pictures come late and then together), which the network clears in a tenth of a second at 2.6 MB/s and the PS2
+# by showing the newest; starting the capture again costs half a second of stillness, a jolt every two minutes
+BEHIND = 20
 
 
 # Above the game: with one filling the CPU (Fortnite on a 4-core laptop, 2026-11-15) pictures came up to 1.6 s late

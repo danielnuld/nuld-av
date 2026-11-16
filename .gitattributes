@@ -1,0 +1,2 @@
+# built in WSL: line endings stay LF on Windows too (a CRLF build.sh or Makefile breaks there)
+* text=auto eol=lf

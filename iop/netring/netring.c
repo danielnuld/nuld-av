@@ -91,7 +91,7 @@ static u8 ftmp[64 + 1600] __attribute__((aligned(64)));                      // 
 static u8 fsaved[FAST_HDR], *frx;
 static const SmapModularExportTable_t *smap;
 static volatile u32 f_expect, f_ready[2];
-static volatile int f_gap, f_end, f_stalled, f_on;
+static volatile int f_gap, f_end, f_stalled, f_on, f_flush;
 static u32 f_n, f_len, f_gaps;
 static char f_req[48];
 static int f_cur;
@@ -139,8 +139,14 @@ static int fast_enq(void *pbuf)
 	f_n += len;
 	// full, or a short datagram: the sender has no more for now (a live picture's end, or the stream's), so what is
 	// here goes to the EE at once instead of waiting for 32 KB. The sender keeps those ends on multiples of 16 bytes
-	if (f_n + FAST_PAY > NETRING_CHUNK || len < FAST_PAY) {
-		f_ready[f_cur] = f_n, f_n = 0;
+	// ...when the other stage is free. While it is not (it takes the thread a tick or two to send it), this one goes
+	// on filling and leaves when the other is back (here or in rx_fast): stalling on every short datagram threw away
+	// whatever came in those 2 ms, and live there are 70 short ones a second (a picture's end, a sound frame), often
+	// back to back: 1.6% of the datagrams lost on the console with a game, half of everything sent twice
+	int full = f_n + FAST_PAY > NETRING_CHUNK;
+	if (full || len < FAST_PAY) f_flush = 1;
+	if (f_flush && (full || !f_ready[f_cur ^ 1])) {
+		f_ready[f_cur] = f_n, f_n = 0, f_flush = 0;
 		if (!f_ready[f_cur ^ 1]) f_cur ^= 1;
 		else f_stalled = 1;
 	}
@@ -156,6 +162,12 @@ static void rx_fast(void *arg)
 	(void)arg;
 	while (!stop) {
 		if (busy >= 0 && sceSifDmaStat(dma_id) < 0) f_ready[busy] = 0, busy = -1; // that stage reached the EE
+		if (f_flush) { // a stage that waited for the other (fast_enq): not while a frame is being read into it
+			int intr;
+			CpuSuspendIntr(&intr);
+			if (f_flush && !frx && f_n && !f_ready[f_cur ^ 1]) f_ready[f_cur] = f_n, f_n = 0, f_flush = 0, f_cur ^= 1;
+			CpuResumeIntr(intr);
+		}
 		u32 n = f_ready[d];
 		if (busy < 0 && n && w + n - acked <= ee_size) {
 			u32 off = w % ee_size, first = ee_size - off < n ? ee_size - off : n;
@@ -214,7 +226,7 @@ static int start(const nr_start_t *p)
 		lwip_bind(sock, (struct sockaddr *)&a, sizeof a);
 		memset(&a, 0, sizeof a);
 		memcpy(f_req, p->req, sizeof p->req), f_req[sizeof p->req] = 0;
-		f_expect = 0, f_ready[0] = f_ready[1] = 0, f_gap = f_end = f_stalled = 0, f_n = f_gaps = 0, f_cur = 0;
+		f_expect = 0, f_ready[0] = f_ready[1] = 0, f_gap = f_end = f_stalled = f_flush = 0, f_n = f_gaps = 0, f_cur = 0;
 		if (!smap) smap = SmapModularGetExportTable();
 		if (!smap || smap->RegisterHook(&fast_hooks, 0)) { lwip_close(sock), sock = -1; return -5; }
 		f_on = 1;

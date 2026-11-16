@@ -76,7 +76,7 @@ class _Client:
         self.again, self.total = 0, 0
         self.pace, self.eased, self.due, self.last = rate, now, 0.0, now  # the pace now: eased off when datagrams are lost
         self.mark = (0, 0)
-        self.back_at, self.back_when = -1, now
+        self.back_at, self.back_when, self.last_tx = -1, now, now
 
     def go_back(self, now):
         self.next, self.moved, self.again = self.base, now, self.again + 1
@@ -93,7 +93,10 @@ class _Client:
         # a gap: again from what it wants, at once (everything sent past the gap is thrown away there: on the console,
         # 2026-11-15, waiting 20 ms here cost ~40 datagrams a gap and a storm of gaps halved the rate). Once per
         # place: the datagrams already on their way make it say "gap" again
-        if flags & 1 and self.next > self.base and (self.base != self.back_at or now - self.back_when > 0.03):
+        # ...or datagrams are out, it still wants the first of them and nothing was sent after to show it the gap
+        # (a live picture's last datagram lost): again without waiting for the 100 ms below
+        quiet = self.next > self.base and expect == self.base and now - self.last_tx > 0.015
+        if (flags & 1 or quiet) and self.next > self.base and (self.base != self.back_at or now - self.back_when > 0.03):
             self.back_at, self.back_when = self.base, now
             self.go_back(now)
 
@@ -141,6 +144,7 @@ class _Client:
             except OSError:
                 break
             self.next, self.sent, self.total, did = self.next + 1, self.sent + PAY, self.total + 1, True
+            self.last_tx = now
         return did
 
     def report(self, name):

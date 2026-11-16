@@ -13,3 +13,4 @@ __pycache__/
 *.m2v
 *.mp2
 dist/
+tools/psvpack.exe

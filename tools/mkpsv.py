@@ -116,9 +116,13 @@ class Chunks:
 def pack_mux(m2v, mp2, psm, num, den):
     """MPEG-2 video + MP2 audio -> the .psm stream; the inputs are deleted."""
     psv = m2v.with_suffix(".psv")
-    wsl = lambda p: subprocess.run(["wsl", "wslpath", "-a", str(p).replace("\\", "/")], capture_output=True, text=True,
-                                   check=True).stdout.strip()
-    subprocess.run(["wsl", "./tools/psvpack", wsl(m2v), wsl(psv), str(num), str(den)], check=True)
+    exe = Path(__file__).with_name("psvpack.exe")  # the Windows build (tools/build_psvpack.bat), else WSL's
+    if exe.exists():
+        subprocess.run([str(exe), str(m2v), str(psv), str(num), str(den)], check=True)
+    else:
+        wsl = lambda p: subprocess.run(["wsl", "wslpath", "-a", str(p).replace("\\", "/")], capture_output=True,
+                                       text=True, check=True).stdout.strip()
+        subprocess.run(["wsl", "./tools/psvpack", wsl(m2v), wsl(psv), str(num), str(den)], check=True)
     v, a = psv.read_bytes(), mp2.read_bytes()
     assert v[:4] == b"PSV1"
     w, h, pics = struct.unpack_from("<HHI", v, 4)

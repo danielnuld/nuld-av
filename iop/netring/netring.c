@@ -178,8 +178,8 @@ static void rx_fast(void *arg)
 		// the server's leave to send: what the ring and the free stage still take
 		// the request again until the stream starts: lwIP drops a datagram sent while it still asks for the
 		// server's address (ARP), and the console's first test of 2026-11-15 never got an answer
-		if (!f_expect && !f_gap && ++ask >= 100) ask = 0, lwip_send(sock, f_req, strlen(f_req), 0);
-		if (f_gap || ++tick >= 4) { // every 8 ms: a send through lwIP is dear
+		if (!f_expect && !f_gap && ++ask >= 200) ask = 0, lwip_send(sock, f_req, strlen(f_req), 0);
+		if (f_gap || ++tick >= 8) { // every 8 ms: a send through lwIP is dear
 			u32 room = ee_size - (w - acked), win = room > 3 * NETRING_CHUNK ? (room - 3 * NETRING_CHUNK) / FAST_PAY : 0;
 			u8 fb[13] = {'F'};
 			u32 e = f_expect, fl = f_gap;
@@ -191,7 +191,7 @@ static void rx_fast(void *arg)
 			fb[9] = fl, fb[10] = fb[11] = fb[12] = 0;
 			lwip_send(sock, fb, sizeof fb, 0);
 		}
-		DelayThread(2000);
+		DelayThread(1000); // a live picture waits for this tick to leave for the EE
 	}
 	f_on = 0;
 	smap->RegisterHook(NULL, 0);

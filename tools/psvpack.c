@@ -31,7 +31,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32 // cl /O2 tools/psvpack.c (tools/build_psvpack.bat): through WSL's pipes a live picture took ~30 ms more
+#include <fcntl.h>
+#include <io.h>
+#define read _read
+typedef int ssize_t;
+#else
 #include <unistd.h>
+#endif
 
 static uint8_t *B;
 static size_t N, bcap;
@@ -360,8 +367,12 @@ int main(int argc, char **argv)
 	streaming = !strcmp(argv[1], "-");
 	if (argc > 4) fps_num = atoi(argv[3]), fps_den = atoi(argv[4]);
 	uint8_t head[64] = "PSV1";
-	if (streaming) o = stdout;
-	else {
+	if (streaming) {
+#ifdef _WIN32
+		_setmode(0, _O_BINARY), _setmode(1, _O_BINARY);
+#endif
+		o = stdout;
+	} else {
 		FILE *f = fopen(argv[1], "rb");
 		if (!f) { perror(argv[1]); return 1; }
 		fseek(f, 0, SEEK_END);

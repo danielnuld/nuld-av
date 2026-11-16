@@ -141,7 +141,7 @@ static void demux(void *u)
 		const u8 *p;
 		int n = source.pull(source.user, &p);
 		if (n < 0) break;
-		if (!n) { usleep(2000); continue; }
+		if (!n) { usleep(live ? 500 : 2000); continue; }
 		total += n;
 		if (hn < 64) {
 			int k = 64 - hn < n ? 64 - hn : n;
@@ -488,7 +488,7 @@ static void *next_picture(void) // the queue's next picture decoded; NULL at the
 {
 	while (pq_rd == pq_wr) {
 		if (eof || stop) return NULL;
-		usleep(1000);
+		usleep(live ? 500 : 1000);
 	}
 	u32 i = pq_rd % PQ;
 	const u8 *p = vbuf + pq_off[i];

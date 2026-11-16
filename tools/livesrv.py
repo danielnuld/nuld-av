@@ -13,6 +13,7 @@ import struct
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import fastsrv
 
@@ -21,17 +22,25 @@ class Live:
     """ffmpeg -> psvpack -> whole pictures, handed to fastsrv picture by picture."""
 
     def __init__(self, a):
-        grab = ["-f", "gdigrab", "-framerate", str(a.fps), "-draw_mouse", "1"]
-        grab += ["-i", f"title={a.title}"] if a.title else ["-i", "desktop"]
-        # no B pictures (nothing to reorder), one whole picture every two seconds, each written out as it is coded.
-        # The buffer the rate control counts on is small: no picture much larger than its share, so none waits
+        pre = ""
+        if getattr(a, "grab", "gdigrab") == "ddagrab":  # Desktop Duplication: the frames come from the GPU
+            grab, pre = ["-f", "lavfi", "-i", f"ddagrab=framerate={a.fps}:draw_mouse=1"], "hwdownload,format=bgra,"
+        else:
+            grab = ["-f", "gdigrab", "-framerate", str(a.fps), "-draw_mouse", "1"]
+            grab += ["-i", f"title={a.title}"] if a.title else ["-i", "desktop"]
+        # no B pictures (nothing to reorder), each picture written out as it is coded. A whole picture only every ten
+        # seconds: it is ~100 KB, 40 ms and more on the PS2's network, and nothing is lost on the way that it would
+        # have to repair (cuts get their own). The rate control's buffer is small: no picture much over its share
         self.ffmpeg = subprocess.Popen(
             ["ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", *grab,
-             "-vf", "scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p",
-             "-c:v", "mpeg2video", "-bf", "0", "-g", str(a.fps * 2), "-dc", "10", "-b:v", a.rate, "-maxrate", a.rate,
+             "-vf", pre + "scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p",
+             "-c:v", "mpeg2video", "-bf", "0", "-g", str(a.fps * 10), "-dc", "10", "-b:v", a.rate, "-maxrate", a.rate,
              "-bufsize", str(int(float(a.rate.rstrip("M")) * 1e6 / 4)), "-flags", "+low_delay", "-flush_packets", "1",
              "-f", "mpeg2video", "-"], stdout=subprocess.PIPE, bufsize=0)
-        self.pack = subprocess.Popen(["wsl", "./tools/psvpack", "-", "-", str(a.fps), "1"], stdin=self.ffmpeg.stdout,
+        # the Windows build if it is there (tools/build_psvpack.bat): through WSL's pipes a picture took ~30 ms more
+        exe = Path(__file__).with_name("psvpack.exe")
+        pack = [str(exe)] if exe.exists() else ["wsl", "./tools/psvpack"]
+        self.pack = subprocess.Popen([*pack, "-", "-", str(a.fps), "1"], stdin=self.ffmpeg.stdout,
                                      stdout=subprocess.PIPE, bufsize=0)
         self.units, self.cur, self.at, self.ended = collections.deque(), b"", 0, False
         self.lock = threading.Lock()
@@ -94,6 +103,7 @@ def main():
     ap.add_argument("--rate", default="12M", help="video bit rate (default 12M; the PS2's network takes ~20M)")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--title", help="one window instead of the desktop")
+    ap.add_argument("--grab", default="gdigrab", choices=["gdigrab", "ddagrab"], help="how the screen is captured")
     a = ap.parse_args()
     subprocess.run(["wsl", "true"], capture_output=True)  # WSL up before the first picture needs it (seconds, cold)
     fastsrv.serve(8091, lambda what: Live(a), "live")

@@ -1,0 +1,14 @@
+# build output
+*.o
+*.a
+*.elf
+*.irx
+example/*_irx.c
+iop/netring/obj/
+tools/psvpack
+__pycache__/
+# streams
+*.psm
+*.psv
+*.m2v
+*.mp2

@@ -50,6 +50,11 @@ def audio_feed(live):
 BEHIND = 6
 
 
+# Above the game: with one filling the CPU (Fortnite on a 4-core laptop, 2026-11-15) pictures came up to 1.6 s late
+# and the sound up to 320 ms, at normal priority. This process too (Live.__init__): it paces the datagrams
+HIGH = getattr(subprocess, "HIGH_PRIORITY_CLASS", 0)
+
+
 class Live:
     """ffmpeg -> psvpack -> whole pictures (and MP2 frames), handed to fastsrv as they come.
     a: fps, rate ("12M"), title, grab ("gdigrab" / "ddagrab"), encoder ("mpeg2video" / "mpeg2_qsv"), region
@@ -57,6 +62,9 @@ class Live:
 
     def __init__(self, a):
         self.a, self.audio = a, getattr(a, "audio", False)
+        if HIGH:
+            import ctypes
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.c_void_p(-1), HIGH)  # -1: this process
         if self.audio:
             # An ffmpeg of its own for the sound, MP2, a frame per datagram to this local port (audio_reader). Not the
             # video's: ffmpeg keeps its inputs in step, so each hiccup of the capture under a game held the sound
@@ -72,7 +80,7 @@ class Live:
                 ["ffmpeg", "-loglevel", "error", "-f", "s16le", "-ar", "4000", "-ac", "2", "-i", "pipe:0",
                  "-af", "asetrate=48000", "-c:a", "mp2", "-b:a", arate, "-flush_packets", "1", "-f", "mp2",
                  f"udp://127.0.0.1:{self.asock.getsockname()[1]}?pkt_size={frame}"],
-                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, creationflags=HIGH)
         self.units, self.cur, self.at, self.ended, self.closed = collections.deque(), b"", 0, False, False
         self.lock = threading.Lock()
         self.made = self.most = self.starts = self.vwait = self.flushed = 0
@@ -118,12 +126,12 @@ class Live:
         self.ffmpeg = subprocess.Popen(
             ["ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", *src,
              *enc, "-flush_packets", "1", "-f", "mpeg2video", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, creationflags=HIGH)
         # the Windows build if it is there (tools/build_psvpack.bat): through WSL's pipes a picture took ~30 ms more
         exe = Path(__file__).with_name("psvpack.exe")
         pack = [str(exe)] if exe.exists() else ["wsl", "./tools/psvpack"]
         self.pack = subprocess.Popen([*pack, "-", "-", str(a.fps), "1"], stdin=self.ffmpeg.stdout,
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, creationflags=HIGH)
         self.last = time.time()
         self.starts += 1
 
@@ -163,7 +171,7 @@ class Live:
                             self.made += 1
                             self.vwait += 1
                             self.most = max(self.most, self.vwait)
-                            late = self.vwait > BEHIND
+                            late = self.vwait > BEHIND and not self.closed
                             if late:  # see BEHIND
                                 self.units.clear()
                                 self.vwait, self.flushed = 0, self.flushed + 1

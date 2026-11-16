@@ -95,11 +95,12 @@ static void set_matrix(const u32 *m, u32 cmd)
 
 int psv_open(int w, int h)
 {
-	psv_close();
-	mbw = (w + 15) / 16, mbh = (h + 15) / 16;
+	static int aw, ah;
+	if (arena && (w != aw || h != ah)) free(arena), arena = NULL;
+	mbw = (w + 15) / 16, mbh = (h + 15) / 16, aw = w, ah = h;
 	// a row and a macroblock more per frame: the gather reads the block to the right and the one under
 	u32 size = (mbw * (mbh + 1) + 1) * sizeof(mb_t);
-	arena = memalign(64, size * PSV_FRAMES + mbw * mbh * 2);
+	if (!arena) arena = memalign(64, size * PSV_FRAMES + mbw * mbh * 2); // kept after psv_close: see nav.c
 	if (!arena) return 0;
 	for (int i = 0; i < PSV_FRAMES; i++) frame[i] = (mb_t *)((u8 *)arena + i * size);
 	mbxy = (void *)((u8 *)arena + PSV_FRAMES * size);
@@ -119,7 +120,6 @@ void psv_close(void)
 {
 	if (!arena) return;
 	ipu_reset();
-	free(arena), arena = NULL;
 }
 
 static int wait_bdec(void)

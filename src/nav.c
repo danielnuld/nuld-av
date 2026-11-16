@@ -525,9 +525,18 @@ static int play(const nav_source *src, void (*log)(const char *line), nav_stats 
 	// under the player's threads while it runs: the decoder must give way to the three of them
 	ReferThreadStatus(GetThreadId(), &me);
 	ChangeThreadPriority(GetThreadId(), 0x60);
-	vbuf = memalign(64, VBUF), aring = (ring){memalign(64, ABUF), ABUF, 0, 0};
-	chain = memalign(64, (80 * 45 * 3 * 6 + 12 * 144 + 16) * 16); // 720p: 3600 macroblocks x 3 planes, 12 bands
-	ref_at = malloc(80 * 45 * 3 * 4), ref_off = malloc(80 * 45 * 3 * 4);
+	// Taken once and kept (the decoder's frames too, psv_open): 20 MB of the EE's 32. Freed and taken again, the
+	// second play of a program that allocates anything in between found no 10 MB in one piece (console, 2026-11-15,
+	// NULD Link: -2 on every stream after the first)
+	static u8 *k_vbuf, *k_aring;
+	static qword_t *k_chain;
+	static u32 *k_at, *k_off;
+	if (!k_vbuf) {
+		k_vbuf = memalign(64, VBUF), k_aring = memalign(64, ABUF);
+		k_chain = memalign(64, (80 * 45 * 3 * 6 + 12 * 144 + 16) * 16); // 720p: 3600 macroblocks x 3 planes, 12 bands
+		k_at = malloc(80 * 45 * 3 * 4), k_off = malloc(80 * 45 * 3 * 4);
+	}
+	vbuf = k_vbuf, aring = (ring){k_aring, ABUF, 0, 0}, chain = k_chain, ref_at = k_at, ref_off = k_off;
 	if (!vbuf || !aring.b || !chain || !ref_at || !ref_off) { ret = -2; goto end; }
 	if (!live) audsrv_init();
 
@@ -620,8 +629,6 @@ end:
 		DeleteThread(dtid);
 	}
 	if (out) *out = (nav_stats){s_pics, decoded, shown, dropped, late};
-	free(vbuf), free(aring.b), free(chain), free(ref_at), free(ref_off);
-	vbuf = NULL, chain = NULL;
 	ChangeThreadPriority(GetThreadId(), me.current_priority);
 	return ret;
 }

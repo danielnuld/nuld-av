@@ -22,9 +22,8 @@ import fastsrv
 
 
 def audio_feed(live):
-    """Windows' sound to ffmpeg, 10 ms at a time, for as long as the stream lives: to whichever ffmpeg is running
-    (one thread for all of them: soundcard's COM set-up did not survive a second thread). soundcard pads silence with
-    zeros (WASAPI loopback itself sends nothing while nothing plays), so ffmpeg's audio input never starves."""
+    """Windows' sound to the audio ffmpeg, 10 ms at a time, for as long as the stream lives. soundcard pads silence
+    with zeros (WASAPI loopback itself sends nothing while nothing plays), so ffmpeg's input never starves."""
     import warnings
 
     import numpy as np
@@ -36,9 +35,9 @@ def audio_feed(live):
             while not live.closed:
                 pcm = (np.clip(r.record(numframes=480), -1, 1) * 32767).astype("<i2").tobytes()
                 try:
-                    live.ffmpeg.stdin.write(pcm)
-                except (OSError, ValueError, AttributeError):  # that ffmpeg left; the next one gets the next 10 ms
-                    time.sleep(0.01)
+                    live.affmpeg.stdin.write(pcm)
+                except (OSError, ValueError):  # closed
+                    break
     except Exception as e:
         print(f"live: audio capture stopped ({type(e).__name__}: {e})", flush=True)
 
@@ -58,14 +57,28 @@ class Live:
 
     def __init__(self, a):
         self.a, self.audio = a, getattr(a, "audio", False)
-        if self.audio:  # ffmpeg's MP2 frames come back on this local port, whichever ffmpeg it is (audio_reader)
+        if self.audio:
+            # An ffmpeg of its own for the sound, MP2, a frame per datagram to this local port (audio_reader). Not the
+            # video's: ffmpeg keeps its inputs in step, so each hiccup of the capture under a game held the sound
+            # back too, and each restart of the capture cut it.
+            # 48000 Hz declared as 4000 and set right by asetrate: ffmpeg cuts raw audio into packets of about a tenth
+            # of a second, and the MP2 frames left four at a time every 90 ms (measured; 20-30 ms apart like this).
+            # The PS2 holds ~100 ms of sound: it ran dry and then had too much, twice a second
             self.asock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.asock.bind(("127.0.0.1", 0))
+            arate = getattr(a, "audio_rate", "192k")
+            frame = int(arate.rstrip("kK")) * 1000 * 1152 // 48000 // 8
+            self.affmpeg = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error", "-f", "s16le", "-ar", "4000", "-ac", "2", "-i", "pipe:0",
+                 "-af", "asetrate=48000", "-c:a", "mp2", "-b:a", arate, "-flush_packets", "1", "-f", "mp2",
+                 f"udp://127.0.0.1:{self.asock.getsockname()[1]}?pkt_size={frame}"],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         self.units, self.cur, self.at, self.ended, self.closed = collections.deque(), b"", 0, False, False
         self.lock = threading.Lock()
         self.made = self.most = self.starts = self.vwait = self.flushed = 0
         self.t0 = self.last = time.time()
         self.ffmpeg = self.pack = None
+        self.vgap, self.agap, self.alast = [], [], 0  # s between pictures / sound frames since the last line (watch)
         threading.Thread(target=self.reader, daemon=True).start()
         threading.Thread(target=self.watch, daemon=True).start()
         if self.audio:
@@ -73,7 +86,7 @@ class Live:
             threading.Thread(target=audio_feed, args=(self,), daemon=True).start()
 
     def spawn(self):
-        a, pre, aout = self.a, "", []
+        a, pre = self.a, ""
         if getattr(a, "grab", "gdigrab") == "ddagrab":  # Desktop Duplication: the frames come from the GPU
             grab, pre = ["-f", "lavfi", "-i", f"ddagrab=framerate={a.fps}:draw_mouse=1"], "hwdownload,format=bgra,"
         else:
@@ -82,17 +95,6 @@ class Live:
                 x, y, size = a.region.split(",")
                 grab += ["-offset_x", x, "-offset_y", y, "-video_size", size]
             grab += ["-i", f"title={a.title}"] if getattr(a, "title", None) else ["-i", "desktop"]
-        if self.audio:
-            # MP2, a frame per datagram to the local port. Not in one output with the video: ffmpeg's muxers hold a
-            # stream back for the other, and the pictures left in bursts paced by the audio frames
-            arate = getattr(a, "audio_rate", "192k")
-            frame = int(arate.rstrip("kK")) * 1000 * 1152 // 48000 // 8
-            # 48000 Hz declared as 4000 and set right by asetrate: ffmpeg cuts raw audio into packets of about a tenth
-            # of a second, and the MP2 frames left four at a time every 90 ms (measured; 20-30 ms apart like this).
-            # The PS2 holds ~100 ms of sound: it ran dry and then had too much, twice a second
-            grab += ["-f", "s16le", "-ar", "4000", "-ac", "2", "-i", "pipe:0"]
-            aout = ["-map", "1:a", "-af", "asetrate=48000", "-c:a", "mp2", "-b:a", arate, "-f", "mp2",
-                    f"udp://127.0.0.1:{self.asock.getsockname()[1]}?pkt_size={frame}"]
         # no B pictures (nothing to reorder), each picture written out as it is coded. A whole picture only every ten
         # seconds: it is ~100 KB, 40 ms and more on the PS2's network, and nothing is lost on the way that it would
         # have to repair (cuts get their own). The rate control's buffer is small: no picture much over its share
@@ -105,11 +107,18 @@ class Live:
         else:
             fmt = "yuv420p"
             enc = ["-c:v", "mpeg2video", "-bf", "0", "-g", str(a.fps * 10), "-dc", "10", *rate, "-flags", "+low_delay"]
+        src = [*grab, "-map", "0:v",
+               "-vf", pre + f"scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format={fmt}"]
+        if fmt == "nv12" and pre:
+            # ddagrab + Quick Sync: captured, scaled and coded on the GPU, the picture never comes down to memory
+            # (hwdownload and swscale on a whole desktop were the CPU's, and the CPU is the game's)
+            src = ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "qsv=qs@dx", "-filter_hw_device", "dx",
+                   "-filter_complex", f"ddagrab=framerate={a.fps}:draw_mouse=1,hwmap=derive_device=qsv,"
+                   "vpp_qsv=w=1280:h=720:format=nv12:out_color_matrix=bt709:out_range=tv"]
         self.ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", *grab, "-map", "0:v",
-             "-vf", pre + f"scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format={fmt}",
-             *enc, "-flush_packets", "1", "-f", "mpeg2video", "-", *aout],
-            stdin=subprocess.PIPE if self.audio else None, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+            ["ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", *src,
+             *enc, "-flush_packets", "1", "-f", "mpeg2video", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         # the Windows build if it is there (tools/build_psvpack.bat): through WSL's pipes a picture took ~30 ms more
         exe = Path(__file__).with_name("psvpack.exe")
         pack = [str(exe)] if exe.exists() else ["wsl", "./tools/psvpack"]
@@ -158,6 +167,7 @@ class Live:
                             if late:  # see BEHIND
                                 self.units.clear()
                                 self.vwait, self.flushed = 0, self.flushed + 1
+                        self.vgap.append(time.time() - self.last)
                         self.last = time.time()
                         unit = b""
                         if late:
@@ -172,16 +182,26 @@ class Live:
         self.ended = True
 
     def watch(self):  # a capture alive and silent for 2 s is as dead as one that left
+        n = 0
         while not self.closed:
             time.sleep(0.5)
             if time.time() - self.last > 2:
                 self.last = time.time()
                 self.kill()
+            n += 1
+            if n % 10 == 0 and self.vgap:  # every 5 s: how evenly the PC makes them (a game takes its share of it)
+                v, a, self.vgap, self.agap = sorted(self.vgap), sorted(self.agap), [], []
+                print(f"live: {len(v)} pictures in 5 s, {sum(g > 0.05 for g in v)} of them over 50 ms after the one "
+                      f"before (longest {v[-1] * 1000:.0f} ms); sound frames at most {a[-1] * 1000 if a else 0:.0f} ms apart",
+                      flush=True)
 
     def audio_reader(self):  # an MP2 frame -> an 'A' chunk and padding to 16 bytes, once the stream has begun
         try:
             while not self.closed:
                 d = self.asock.recv(4096)
+                now = time.time()
+                self.agap.append(now - (self.alast or now))
+                self.alast = now
                 if self.made:
                     pad = -len(d) % 16
                     with self.lock:
@@ -215,7 +235,8 @@ class Live:
               flush=True)
         self.closed = self.ended = True
         self.kill()
-        if hasattr(self, "asock"):
+        if self.audio:
+            self.affmpeg.kill()
             self.asock.close()
 
 

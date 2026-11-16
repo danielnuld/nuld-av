@@ -56,5 +56,7 @@ python tools/avsrv.py out.psm
 
 ## Licence
 
-`src/psvdec.c` and `src/mc.s` derive from ps2sdk's libmpeg, Copyright (c) 2006-2007 Eugene Plotnikov, Academic Free
-License 2.0.
+MIT (see `LICENSE`): use it in any PS2 project.
+
+Two files keep their origin's licence: `src/psvdec.c` and `src/mc.s` derive from ps2sdk's libmpeg, Copyright (c)
+2006-2007 Eugene Plotnikov, Academic Free License 2.0.

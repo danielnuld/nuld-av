@@ -35,13 +35,19 @@ def _run(port, open_stream, name):
         now = time.perf_counter()
         if data:
             if data[:4] == b"fast":
-                if client and client.addr == addr and client.base == 0 and now - client.t0 < 3:
-                    continue  # the request said again before our first datagram reached it
+                # the PS2 says its request again until our first datagram reaches it, and a live source can take
+                # seconds to give one. The same request is the same stream: starting another under a PS2 that had
+                # taken datagrams of the first (console, 2026-11-15) fed it two streams spliced, and it froze
+                if client and client.addr == addr and client.req == data:
+                    client.heard = now
+                    continue
                 if client:
                     client.report(name)
                 parts = data.split()
                 read = open_stream(parts[2].decode() if len(parts) > 2 else "")
                 client = _Client(addr, max(1, int(parts[1])) * 1024, read, now) if read else None
+                if client:
+                    client.req = data
             elif client and addr == client.addr:
                 if data[:1] == b"F" and len(data) >= 13:
                     client.feedback(*struct.unpack_from("<IHxxI", data, 1), now)

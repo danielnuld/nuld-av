@@ -66,12 +66,19 @@ class Live:
 
     def read(self, n):
         with self.lock:
-            if self.at >= len(self.cur):
-                if not self.units:
-                    return b"" if self.ended else None
-                self.cur, self.at = self.units.popleft(), 0
-            d = self.cur[self.at:self.at + n]  # short at a picture's end: the PS2 gets it at once
-            self.at += len(d)
+            d = b""
+            while len(d) < n:
+                if self.at >= len(self.cur):
+                    if not self.units:
+                        break
+                    self.cur, self.at = self.units.popleft(), 0
+                k = self.cur[self.at:self.at + n - len(d)]
+                self.at += len(k)
+                d += k
+            # short only when nothing more is waiting: the PS2 hands what it has to its player at once on a short
+            # datagram, and one such for each of a row of small pictures is more than it can do
+            if not d:
+                return b"" if self.ended else None
             return d
 
     def close(self):
@@ -88,6 +95,7 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--title", help="one window instead of the desktop")
     a = ap.parse_args()
+    subprocess.run(["wsl", "true"], capture_output=True)  # WSL up before the first picture needs it (seconds, cold)
     fastsrv.serve(8091, lambda what: Live(a), "live")
     print("waiting for the PS2 on UDP 8091", flush=True)
     while True:

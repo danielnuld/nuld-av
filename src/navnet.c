@@ -52,7 +52,11 @@ int nav_net_open(unsigned int ip, int port, int kbs, nav_source *src)
 	s.ring = (u32)ring & 0x1fffffff, s.size = sizeof ring, s.status = (u32)st_mem & 0x1fffffff;
 	ST->write = 0, ST->done = 0, ST->err = 0, rd = acked = 0;
 	// the fast path; plain TCP if the module can't hook the Ethernet driver (smap.irx instead of the modular one)
-	snprintf(s.req, sizeof s.req, "fast %d play\n", kbs);
+	// The number at the end tells this request from the last one's repeats: the IOP says it again until the stream
+	// starts, and the server must not take those for a new stream
+	u32 once;
+	__asm__ volatile("mfc0 %0, $9" : "=r"(once));
+	snprintf(s.req, sizeof s.req, "fast %d play %u\n", kbs, once);
 	memcpy(buf, &s, sizeof s);
 	int r = call(NR_START, sizeof s);
 	if (r < 0) {

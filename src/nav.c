@@ -108,6 +108,9 @@ static void feed(const u8 *p, u32 n)
 			if (ck.hn < 8) break;
 			ck.hn = 0, ck.type = ck.hd[0];
 			memcpy(&ck.left, ck.hd + 4, 4);
+			// 'P': padding. Anything else is not our stream (or it lost its place): better ended than read on as
+			// if a chunk's bytes were its length
+			if (ck.type != 'V' && ck.type != 'A' && ck.type != 'P') { eof = 2; return; }
 			if (ck.type == 'V' && ck.left) {
 				if (ck.left > VBUF / 2) { eof = 2; return; } // no picture is that large: not our stream
 				ck.len = ck.left, ck.off = pv_alloc(ck.len), ck.dst = vbuf + ck.off;

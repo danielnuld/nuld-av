@@ -43,6 +43,13 @@ def audio_feed(live):
         print(f"live: audio capture stopped ({type(e).__name__}: {e})", flush=True)
 
 
+# Pictures made and not yet taken by the PS2 before they are given up: its network or its decoder is not keeping up,
+# and everything behind them (the sound too) would come out that much late, later and later. They are dropped, the
+# capture starts again (its first picture is a whole one: nothing after it needs the dropped ones) at 3/4 of the bit
+# rate. 6 pictures: 200 ms
+BEHIND = 6
+
+
 class Live:
     """ffmpeg -> psvpack -> whole pictures (and MP2 frames), handed to fastsrv as they come.
     a: fps, rate ("12M"), title, grab ("gdigrab" / "ddagrab"), encoder ("mpeg2video" / "mpeg2_qsv"), region
@@ -55,7 +62,8 @@ class Live:
             self.asock.bind(("127.0.0.1", 0))
         self.units, self.cur, self.at, self.ended, self.closed = collections.deque(), b"", 0, False, False
         self.lock = threading.Lock()
-        self.made = self.most = self.starts = 0
+        self.made = self.most = self.starts = self.vwait = self.flushed = 0
+        self.scale = 1.0  # of the asked bit rate: down each time the PS2 could not keep up
         self.t0 = self.last = time.time()
         self.ffmpeg = self.pack = None
         threading.Thread(target=self.reader, daemon=True).start()
@@ -85,7 +93,8 @@ class Live:
         # no B pictures (nothing to reorder), each picture written out as it is coded. A whole picture only every ten
         # seconds: it is ~100 KB, 40 ms and more on the PS2's network, and nothing is lost on the way that it would
         # have to repair (cuts get their own). The rate control's buffer is small: no picture much over its share
-        rate = ["-b:v", a.rate, "-maxrate", a.rate, "-bufsize", str(int(float(a.rate.rstrip("M")) * 1e6 / 4))]
+        bits = int(float(a.rate.rstrip("M")) * 1e6 * self.scale)
+        rate = ["-b:v", str(bits), "-maxrate", str(bits), "-bufsize", str(bits // 4)]
         if getattr(a, "encoder", "mpeg2video") == "mpeg2_qsv":
             # Intel's hardware encoder: the CPU is the game's. async_depth 1: it hands a picture back before it takes
             # the next (4, its default, are 100 ms more)
@@ -128,6 +137,7 @@ class Live:
         video dead, so the PS2 stayed on the last picture (console, 2026-11-15, Fortnite starting)."""
         while not self.closed:
             self.spawn()
+            late = False
             try:
                 unit = self.exactly(64)  # each psvpack's own header: the PS2 gets the first one only
                 if self.made:
@@ -137,15 +147,25 @@ class Live:
                     unit += head + self.exactly(struct.unpack_from("<I", head, 4)[0])
                     if head[:1] == b"P":
                         with self.lock:
-                            self.units.append(unit)
+                            self.units.append((1, unit))
                             self.made += 1
-                            self.most = max(self.most, len(self.units))
+                            self.vwait += 1
+                            self.most = max(self.most, self.vwait)
+                            late = self.vwait > BEHIND
+                            if late:  # see BEHIND
+                                self.units.clear()
+                                self.vwait, self.flushed = 0, self.flushed + 1
+                                self.scale = max(0.25, self.scale * 0.75)
                         self.last = time.time()
                         unit = b""
+                        if late:
+                            print(f"live: the PS2 was {BEHIND} pictures behind: they are dropped and the capture goes on "
+                                  f"at {self.scale * float(self.a.rate.rstrip('M')):.1f} Mbit/s", flush=True)
+                            raise EOFError
             except (EOFError, OSError, ValueError):
                 pass
             self.kill()
-            if not self.closed:
+            if not self.closed and not late:
                 print(f"live: the capture stopped after {self.made} pictures; starting it again", flush=True)
                 time.sleep(0.5)
         self.ended = True
@@ -164,8 +184,8 @@ class Live:
                 if self.made:
                     pad = -len(d) % 16
                     with self.lock:
-                        self.units.append(struct.pack("<B3xI", ord("A"), len(d)) + d +
-                                          struct.pack("<B3xI", ord("P"), pad) + bytes(pad))
+                        self.units.append((0, struct.pack("<B3xI", ord("A"), len(d)) + d +
+                                           struct.pack("<B3xI", ord("P"), pad) + bytes(pad)))
         except OSError:
             pass
 
@@ -176,7 +196,8 @@ class Live:
                 if self.at >= len(self.cur):
                     if not self.units:
                         break
-                    self.cur, self.at = self.units.popleft(), 0
+                    video, self.cur = self.units.popleft()
+                    self.at, self.vwait = 0, self.vwait - video
                 k = self.cur[self.at:self.at + n - len(d)]
                 self.at += len(k)
                 d += k
@@ -189,7 +210,8 @@ class Live:
     def close(self):
         dt = time.time() - self.t0
         print(f"live: {self.made} pictures in {dt:.0f} s ({self.made / max(dt, 1e-3):.1f}/s), at most {self.most} waiting "
-              f"for the PS2 to take them, the capture started {self.starts} times", flush=True)
+              f"for the PS2 to take them, the capture started {self.starts} times, {self.flushed} of them to catch up",
+              flush=True)
         self.closed = self.ended = True
         self.kill()
         if hasattr(self, "asock"):

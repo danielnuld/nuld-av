@@ -55,13 +55,13 @@ def _run(port, open_stream, name):
                     client.report(name)
                     client = None
             continue
-        if client and not client.pump(u, now):
-            if now - client.heard > 5:  # gone
-                client.report(name)
-                client = None
-            else:
+        if client and now - client.heard > 5:  # gone (switched off: no 'X'). Checked whether or not there is
+            client.report(name)                # something to send: there always was, the same window again and again
+            client = None
+        elif client:
+            if not client.pump(u, now):
                 time.sleep(0.0005)
-        elif not client:
+        else:
             time.sleep(0.01)
 
 

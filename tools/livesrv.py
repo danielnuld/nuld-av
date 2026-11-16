@@ -21,18 +21,24 @@ from pathlib import Path
 import fastsrv
 
 
-def audio_feed(pipe):
-    """Windows' sound to ffmpeg, 10 ms at a time, until ffmpeg goes away. soundcard pads silence with zeros (WASAPI
-    loopback itself sends nothing while nothing plays), so ffmpeg's audio input never starves."""
+def audio_feed(live):
+    """Windows' sound to ffmpeg, 10 ms at a time, for as long as the stream lives: to whichever ffmpeg is running
+    (one thread for all of them: soundcard's COM set-up did not survive a second thread). soundcard pads silence with
+    zeros (WASAPI loopback itself sends nothing while nothing plays), so ffmpeg's audio input never starves."""
+    import warnings
+
     import numpy as np
     import soundcard as sc
+    warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)  # "data discontinuity": every hiccup
     try:
         mic = sc.get_microphone(sc.default_speaker().name, include_loopback=True)
         with mic.recorder(samplerate=48000, channels=2, blocksize=480) as r:
-            while True:
-                pipe.write((np.clip(r.record(numframes=480), -1, 1) * 32767).astype("<i2").tobytes())
-    except (OSError, ValueError):  # ffmpeg left (its stdin closed)
-        pass
+            while not live.closed:
+                pcm = (np.clip(r.record(numframes=480), -1, 1) * 32767).astype("<i2").tobytes()
+                try:
+                    live.ffmpeg.stdin.write(pcm)
+                except (OSError, ValueError, AttributeError):  # that ffmpeg left; the next one gets the next 10 ms
+                    time.sleep(0.01)
     except Exception as e:
         print(f"live: audio capture stopped ({type(e).__name__}: {e})", flush=True)
 
@@ -42,7 +48,23 @@ class Live:
     a: fps, rate ("12M"), title, grab ("gdigrab" / "ddagrab"), region ("X,Y,WxH"), audio (bool), audio_rate ("192k")."""
 
     def __init__(self, a):
-        pre = ""
+        self.a, self.audio = a, getattr(a, "audio", False)
+        if self.audio:  # ffmpeg's MP2 frames come back on this local port, whichever ffmpeg it is (audio_reader)
+            self.asock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.asock.bind(("127.0.0.1", 0))
+        self.units, self.cur, self.at, self.ended, self.closed = collections.deque(), b"", 0, False, False
+        self.lock = threading.Lock()
+        self.made = self.most = self.starts = 0
+        self.t0 = self.last = time.time()
+        self.ffmpeg = self.pack = None
+        threading.Thread(target=self.reader, daemon=True).start()
+        threading.Thread(target=self.watch, daemon=True).start()
+        if self.audio:
+            threading.Thread(target=self.audio_reader, daemon=True).start()
+            threading.Thread(target=audio_feed, args=(self,), daemon=True).start()
+
+    def spawn(self):
+        a, pre, aout = self.a, "", []
         if getattr(a, "grab", "gdigrab") == "ddagrab":  # Desktop Duplication: the frames come from the GPU
             grab, pre = ["-f", "lavfi", "-i", f"ddagrab=framerate={a.fps}:draw_mouse=1"], "hwdownload,format=bgra,"
         else:
@@ -51,12 +73,9 @@ class Live:
                 x, y, size = a.region.split(",")
                 grab += ["-offset_x", x, "-offset_y", y, "-video_size", size]
             grab += ["-i", f"title={a.title}"] if getattr(a, "title", None) else ["-i", "desktop"]
-        audio, aout = getattr(a, "audio", False), []
-        if audio:
-            # MP2, a frame per datagram to a local port (read below). Not in one output with the video: ffmpeg's
-            # muxers hold a stream back for the other, and the pictures left in bursts paced by the audio frames
-            self.asock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.asock.bind(("127.0.0.1", 0))
+        if self.audio:
+            # MP2, a frame per datagram to the local port. Not in one output with the video: ffmpeg's muxers hold a
+            # stream back for the other, and the pictures left in bursts paced by the audio frames
             arate = getattr(a, "audio_rate", "192k")
             frame = int(arate.rstrip("kK")) * 1000 * 1152 // 48000 // 8
             grab += ["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0"]
@@ -70,20 +89,20 @@ class Live:
              "-vf", pre + "scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p",
              "-c:v", "mpeg2video", "-bf", "0", "-g", str(a.fps * 10), "-dc", "10", "-b:v", a.rate, "-maxrate", a.rate,
              "-bufsize", str(int(float(a.rate.rstrip("M")) * 1e6 / 4)), "-flags", "+low_delay", "-flush_packets", "1",
-             "-f", "mpeg2video", "-", *aout], stdin=subprocess.PIPE if audio else None, stdout=subprocess.PIPE, bufsize=0)
+             "-f", "mpeg2video", "-", *aout], stdin=subprocess.PIPE if self.audio else None, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0)
         # the Windows build if it is there (tools/build_psvpack.bat): through WSL's pipes a picture took ~30 ms more
         exe = Path(__file__).with_name("psvpack.exe")
         pack = [str(exe)] if exe.exists() else ["wsl", "./tools/psvpack"]
         self.pack = subprocess.Popen([*pack, "-", "-", str(a.fps), "1"], stdin=self.ffmpeg.stdout,
-                                     stdout=subprocess.PIPE, bufsize=0)
-        self.units, self.cur, self.at, self.ended = collections.deque(), b"", 0, False
-        self.lock = threading.Lock()
-        self.made = self.most = 0
-        self.t0 = time.time()
-        threading.Thread(target=self.reader, daemon=True).start()
-        if audio:
-            threading.Thread(target=audio_feed, args=(self.ffmpeg.stdin,), daemon=True).start()
-            threading.Thread(target=self.audio_reader, daemon=True).start()
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        self.last = time.time()
+        self.starts += 1
+
+    def kill(self):
+        for p in (self.ffmpeg, self.pack):
+            if p:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
 
     def exactly(self, n):
         b = b""
@@ -94,25 +113,46 @@ class Live:
             b += d
         return b
 
-    def reader(self):  # psvpack's output cut into pictures: header (the first time) + 'V' chunk + 'P' chunk
-        try:
-            unit = self.exactly(64)
-            while True:
-                head = self.exactly(8)
-                unit += head + self.exactly(struct.unpack_from("<I", head, 4)[0])
-                if head[:1] == b"P":
-                    with self.lock:
-                        self.units.append(unit)
-                        self.made += 1
-                        self.most = max(self.most, len(self.units))
+    def reader(self):
+        """psvpack's output cut into pictures: header (the stream's first time) + 'V' chunk + 'P' chunk. When the
+        capture ends or stops giving pictures (watch), it is started again and the stream goes on with its first
+        picture, a whole one: the screen can't be captured while Windows shows a UAC prompt or a game takes it for
+        itself (gdigrab: "Failed to capture image (error 5)"), and ffmpeg kept running on its audio input with the
+        video dead, so the PS2 stayed on the last picture (console, 2026-11-15, Fortnite starting)."""
+        while not self.closed:
+            self.spawn()
+            try:
+                unit = self.exactly(64)  # each psvpack's own header: the PS2 gets the first one only
+                if self.made:
                     unit = b""
-        except (EOFError, OSError, ValueError):
-            pass
+                while True:
+                    head = self.exactly(8)
+                    unit += head + self.exactly(struct.unpack_from("<I", head, 4)[0])
+                    if head[:1] == b"P":
+                        with self.lock:
+                            self.units.append(unit)
+                            self.made += 1
+                            self.most = max(self.most, len(self.units))
+                        self.last = time.time()
+                        unit = b""
+            except (EOFError, OSError, ValueError):
+                pass
+            self.kill()
+            if not self.closed:
+                print(f"live: the capture stopped after {self.made} pictures; starting it again", flush=True)
+                time.sleep(0.5)
         self.ended = True
+
+    def watch(self):  # a capture alive and silent for 2 s is as dead as one that left
+        while not self.closed:
+            time.sleep(0.5)
+            if time.time() - self.last > 2:
+                self.last = time.time()
+                self.kill()
 
     def audio_reader(self):  # an MP2 frame -> an 'A' chunk and padding to 16 bytes, once the stream has begun
         try:
-            while not self.ended:
+            while not self.closed:
                 d = self.asock.recv(4096)
                 if self.made:
                     pad = -len(d) % 16
@@ -142,10 +182,9 @@ class Live:
     def close(self):
         dt = time.time() - self.t0
         print(f"live: {self.made} pictures in {dt:.0f} s ({self.made / max(dt, 1e-3):.1f}/s), at most {self.most} waiting "
-              "for the PS2 to take them", flush=True)
-        self.ended = True
-        for p in (self.ffmpeg, self.pack):
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+              f"for the PS2 to take them, the capture started {self.starts} times", flush=True)
+        self.closed = self.ended = True
+        self.kill()
         if hasattr(self, "asock"):
             self.asock.close()
 

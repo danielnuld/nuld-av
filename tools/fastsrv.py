@@ -77,6 +77,7 @@ class _Client:
         self.pace, self.eased, self.due, self.last = rate, now, 0.0, now  # the pace now: eased off when datagrams are lost
         self.mark = (0, 0)
         self.back_at, self.back_when, self.last_tx = -1, now, now
+        self.said, self.said_at = (0, 0, 0), now  # base, total, again at the last line printed
 
     def go_back(self, now):
         self.next, self.moved, self.again = self.base, now, self.again + 1
@@ -128,6 +129,12 @@ class _Client:
                 elif waste < 0.03:
                     self.pace = min(self.rate, self.pace * 1.05)
             self.eased, self.mark = now, (self.total, self.base)
+        if now - self.said_at > 5:  # how it goes, every 5 s
+            b, t, a = self.said
+            print(f"{self.addr[0]}: took {(self.base - b) * PAY / 1024 / (now - self.said_at):.0f} KB/s, "
+                  f"{self.total - t} datagrams sent for {self.base - b} taken, again from a gap {self.again - a} times, "
+                  f"pace {self.pace / 1024:.0f} KB/s, window {self.window}", flush=True)
+            self.said, self.said_at = (self.base, self.total, self.again), now
         did = False
         self.due += (now - self.last) * self.pace
         self.last, due = now, self.due
